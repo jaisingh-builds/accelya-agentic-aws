@@ -44,7 +44,7 @@ accelya-agentic-aws/
 
 ```bash
 # 1. Clone (use your branch when you make commits)
-git clone https://github.com/<org>/accelya-agentic-aws.git
+git clone https://github.com/jaisingh-builds/accelya-agentic-aws.git
 cd accelya-agentic-aws
 
 # 2. Make your branch

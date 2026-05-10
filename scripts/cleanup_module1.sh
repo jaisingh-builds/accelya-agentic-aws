@@ -48,7 +48,7 @@ if [ "$BRANCH" != "main" ] && [ "$BRANCH" != "no-git-branch" ]; then
   echo "4. Pushing branch '$BRANCH'..."
   git push origin "$BRANCH" 2>&1 | tail -5 || true
   echo "   ✓ Pushed. Open a PR on GitHub:"
-  echo "     https://github.com/<org>/accelya-agentic-aws/compare/main...$BRANCH"
+  echo "     https://github.com/jaisingh-builds/accelya-agentic-aws/compare/main...$BRANCH"
 else
   echo "4. Skipping git push (current branch: $BRANCH)"
 fi

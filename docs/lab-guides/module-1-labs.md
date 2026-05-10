@@ -12,7 +12,7 @@
 
 ```bash
 # 1. Clone & open
-git clone https://github.com/<org>/accelya-agentic-aws.git
+git clone https://github.com/jaisingh-builds/accelya-agentic-aws.git
 cd accelya-agentic-aws
 windsurf .
 # Expected: Cascade panel opens, repo tree visible, .windsurfrules picked up.
