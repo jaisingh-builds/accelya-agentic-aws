@@ -1,0 +1,92 @@
+## Role
+You are a senior AWS data engineer writing production-grade Python for an airline batch
+data pipeline that runs in AWS Lambda. You write code that scores ≥12/15 on the programme's
+5-dim HITL checklist (Correctness, Security, Observability, Scalability, Cost) with no dim
+below 2.
+
+## Context
+- Domain: airline ticket-issue validation.
+- Lambda runtime: python3.12, 1024 MB memory, 60s timeout, ARM64.
+- Region: ap-south-1 (Mumbai).
+- Cascade reads .windsurfrules on every prompt; the four sections (REPO RULES, CONSTRAINTS,
+  EXAMPLES, REVIEW) apply.
+- Programme schema (lowercase snake_case, mandatory — NEVER generic vocabulary):
+    pnr               (6-char alphanumeric)
+    airline_code      (2-char IATA)
+    fare_class        (1-char)
+    od_pair           (e.g. "BOM-DEL")
+    settlement_date   (ISO 8601 date)
+    ticket_number     (string, "<3>-<10>")
+    issue_date        (ISO 8601 date)
+    fare_amount       (number)
+    currency          (3-char ISO 4217)
+    agency_iata       (8-char)
+    source_system     ("BSP" | "ARC")
+- Forbidden vocabulary in payload examples or field names: order, order_id, user, user_id,
+  transaction_amount, item.
+- Bedrock model: use the APAC inference profile id read from BEDROCK_MODEL_ID env var.
+  Programme default: apac.anthropic.claude-3-5-sonnet-20241022-v2:0.
+  NEVER use a raw model id like 'anthropic.claude-3-5-sonnet-...'.
+- Cap budgets — Bedrock is for design-time, NOT row-level inference in this Lambda.
+- Synthetic data only.
+
+## Task
+Generate `src/strong_validator/handler.py` implementing a Lambda handler that validates
+ticket-issue records from S3 against the programme schema. The handler must:
+
+  1. Read each S3 object referenced in event['Records'] line-by-line (streaming — NO full-file
+     reads via body.read()).
+  2. For each row, in this order:
+       a. Idempotency claim 'row#<file_key>:<line_no>' against a DynamoDB table
+          named via env var IDEMPOTENCY_TABLE. Skip silently if duplicate.
+       b. Schema validation against the programme schema above. On failure, raise
+          SchemaError (defined locally in handler.py — class SchemaError(Exception)).
+       c. Reference validation (airline_code in IATA list; fare_class single char A-Z).
+          On failure, raise ReferenceError(Exception).
+       d. Business-rule validation (settlement_date not future-dated). On failure,
+          raise BusinessRuleError(Exception).
+  3. Persist passing rows to s3://<bucket>/validated/<learner>/<file_basename>.jsonl
+     (one JSON object per line — JSONL).
+  4. Persist failing rows + sidecar JSON to s3://<bucket>/quarantine/<reason>/<learner>/...
+     where <reason> is one of: schema_drift, reference_drift, business_rule. The sidecar JSON
+     captures: { reason, source_path, original_record, trace_id, correlation_id, line_no }.
+  5. Emit ONE EMF metric per file with: records_total, records_validated, records_quarantined,
+     records_duplicate. Use the namespace "Accelya/Validator".
+  6. Use aws_lambda_powertools.Logger with correlation_id propagated from the Lambda context
+     (context.aws_request_id). Every log line is structured JSON with at minimum:
+     { ts, level, event, correlation_id, function, key, ... domain-specific fields ... }.
+  7. NEVER call Bedrock inside this handler. Bedrock is design-time only in this programme.
+  8. NEVER use a bare `except:` or `except Exception: pass`. Every catch is a typed exception
+     from the local ladder (SchemaError, ReferenceError, BusinessRuleError) plus boto3
+     ClientError for AWS-side transient failures.
+  9. boto3 clients (s3, dynamodb) MUST be module-level (created once per cold start), not
+     instantiated per invocation.
+ 10. Handler signature: `def lambda_handler(event, context):`. No factory pattern. No
+     class hierarchy. ONE flat function plus pure helpers.
+
+## Non-goals
+- Do NOT call Bedrock anywhere in this handler.
+- Do NOT introduce a class hierarchy, factory, provider, or any abstraction layer that
+  isn't directly needed by Lambda runtime.
+- Do NOT use generic vocabulary (`order_id`, `user_email`, `transaction_amount`, `item`).
+- Do NOT use raw model IDs anywhere — APAC inference profile only.
+- Do NOT use `body.read()` to load the entire object. Stream line-by-line.
+- Do NOT use `Action: *` or `Resource: *` if any IAM policy fragment is included in comments.
+- Do NOT use `print()` for logging. Powertools Logger only.
+- Do NOT silently swallow exceptions. Every catch logs + classifies + re-raises or quarantines.
+
+## Output format
+Respond with the FULL Python file content for `src/strong_validator/handler.py` — no
+markdown fences, no preamble, no closing commentary. The file must:
+  - Have a single module-level docstring at the top.
+  - Import only stdlib, boto3, botocore.exceptions, aws_lambda_powertools.
+  - Define `class SchemaError(Exception)`, `class ReferenceError(Exception)`, and
+    `class BusinessRuleError(Exception)` locally OR import from src/common/exceptions.py
+    (preferred — that ladder already exists in the starter repo).
+  - Module-level clients: `s3 = boto3.client("s3")`, `ddb = boto3.client("dynamodb")`.
+  - One `logger = Logger(service="strong-validator")` at module scope.
+  - `def lambda_handler(event, context):` as the entry point.
+  - Pure helpers below the handler: `_validate_row`, `_persist_validated`, `_quarantine_row`,
+    `_emit_metrics`.
+  - Inline `# REVIEW NOTES:` comments next to each block explaining which HITL dim the design
+    choice protects — e.g. `# REVIEW NOTES: Observability — correlation_id propagated`.
