@@ -1,0 +1,51 @@
+# .windsurfrules — v1 (Day 1 / Day 3 baseline)
+# Cascade reads this file on every prompt and weighs it heavily.
+# Edit per module; commit changes alongside artefacts.
+# Promotes to v2 on Day 5 (adds ASL CHUNK CONTEXT + SQS PARTIAL-BATCH CONTEXT),
+# v3 on Day 6 (adds CATALOG CONTEXT), v7 on Day 10 (adds OBSERVABILITY CONTEXT).
+
+## REPO RULES
+  - All Lambdas: src/<component>/handler.py + src/<component>/test_handler.py
+  - Shared types: src/common/exceptions.py (PipelineError ladder)
+  - IaC: infra/template.yaml (SAM)
+  - Prompts:  prompts/v<N>_<purpose>.txt (committed, audit-able)
+  - Reviews:  reviews/HITL_REVIEW-<artefact>.md (5-dim score per output)
+  - Synthetic data only: no real customer / production data anywhere
+  - Airline vocabulary mandatory (PNR, airline_code, fare_class, OD, settlement)
+    NOT generic ('order', 'user', 'item' are forbidden in payload examples)
+
+## CONSTRAINTS
+  - Region:    All AWS API calls originate from ap-south-1 (Mumbai).
+               Bedrock uses APAC cross-region inference profile;
+               AWS may route within supported APAC regions.
+  - Lambda:    max 10 functions per learner; 2048 MB per function;
+               default timeout 30s (modules may override per-lab);
+               Event-driven Lambda only (no always-on worker pattern; sandbox)
+  - Bedrock:   max 50 invocations + 20,000 tokens per learner per session;
+               BEDROCK_MODEL_ID = 'apac.anthropic.claude-3-5-sonnet-20241022-v2:0'
+               (full APAC cross-region inference profile ID; reference via env var);
+               NO Bedrock Studio, Knowledge Bases, Agents, AgentCore
+  - SageMaker: max 1 endpoint; for provisioned endpoints use allowed CPU instance families only;
+               NO GPUs (Day 9 uses Serverless: MemorySizeInMB + MaxConcurrency, not instance type)
+  - Glue:      max 3 jobs / 4 DPU total / 6 DPU-h cumulative; sessions disabled
+  - FIS:       max 20 minutes action time per lab
+  - GitHub:    Free tier (manual cleanup; standard PR workflow)
+  - Cost Explorer API: NOT enabled in sandbox (use CW metric proxies instead)
+  - AWS Budgets: NOT supported (use CW metric-math alarms)
+
+## EXAMPLES
+  - Cancellation envelope:
+      { event_id, event_type:'cancellation', airline_code:'AI', pnr:'6X7Y8Z',
+        booking_date:'2026-05-09', cancel_reason_code:'WX', fare_amount:2845.0 }
+  - Settlement record:
+      { settlement_id:'BSP-2026-W19-AI234-001', bsp_cycle:'2026-W19',
+        airline_code:'AI', amount_local:..., currency:..., pnr:..., issue_date:... }
+  - Quarantine sidecar JSON: { reason, source_path, original_record, trace_id }
+
+## REVIEW
+  - Every Cascade output passes the 5-dim HITL checklist before merge:
+      Correctness · Security · Observability · Scalability · Cost
+  - HITL_REVIEW.md filled per artefact + committed; pass at >=12/15 AND every dim >=2/3
+  - IAM: NEVER wildcards in Action or Resource. Use named verbs + ARN-scoped resources.
+  - Logging: powertools Logger + correlation_id (extracted via correlation_id_path)
+  - Errors: classified into the PipelineError ladder; NEVER bare 'except: pass'

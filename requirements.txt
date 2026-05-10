@@ -1,0 +1,12 @@
+# Day 1 + Day 2 dependencies — minimal set.
+# Add Day 3+ packages (aws_lambda_powertools etc.) per-module when they're needed.
+
+boto3>=1.34.119          # Bedrock Converse API — Day 1 prereq
+botocore>=1.34.119
+
+# Day 3+ (uncomment when you reach Module 3)
+# aws-lambda-powertools>=2.34.0    # structured logging, EMF metrics
+
+# Testing — Module 4+
+# pytest>=8.0.0
+# moto>=5.0.0

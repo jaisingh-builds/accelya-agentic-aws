@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Venv
+venv/
+.venv/
+env/
+
+# AWS / secrets — NEVER commit these
+.aws/
+*.pem
+*.key
+.env
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# macOS
+.DS_Store
+
+# Office lock files
+~$*
+
+# Build artifacts
+*.zip
+*.tar.gz
+dist/
+build/
+
+# Synthetic data outputs (you generate fresh per session)
+data/generated/
+
+# Local trainer scratch
+scratch/

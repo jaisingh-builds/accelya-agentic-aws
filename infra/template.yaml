@@ -1,0 +1,82 @@
+# infra/template.yaml — SAM template skeleton.
+# Programme uses this from Module 4 onward (Lambda deploys, Step Functions, etc.).
+# Day 1 / Day 2 don't deploy from this — it's here as scaffolding.
+
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Accelya Agentic AWS Programme — learner SAM template.
+  Region: ap-south-1. Sandbox caps apply (see .windsurfrules).
+
+Parameters:
+  LearnerName:
+    Type: String
+    Description: Your name suffix for resources (lowercase, no spaces).
+    AllowedPattern: '[a-z0-9-]+'
+
+  ProgrammeBucket:
+    Type: String
+    Default: accelya-airline-data-ap-south-1
+    Description: Shared S3 bucket (trainer-owned). Learners write to learner-sandbox/<name>/.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30                # default; modules may override per-function
+    MemorySize: 1024
+    Architectures: [arm64]
+    Environment:
+      Variables:
+        AWS_REGION: ap-south-1
+        LEARNER: !Ref LearnerName
+        PROGRAMME_BUCKET: !Ref ProgrammeBucket
+        APP_VERSION: m1
+        # BEDROCK_MODEL_ID may be set per-function
+
+Resources:
+
+  # ── Module 1 / 2 placeholder ────────────────────────────────────────────
+  # No Lambda created in Module 1; this template ships for orientation.
+  # Modules 4+ add functions like:
+  #
+  # ValidatorFunction:
+  #   Type: AWS::Serverless::Function
+  #   Properties:
+  #     FunctionName: !Sub "accelya-validator-${LearnerName}"
+  #     CodeUri: src/validator/
+  #     Handler: handler.lambda_handler
+  #     Policies:
+  #       - S3ReadPolicy:
+  #           BucketName: !Ref ProgrammeBucket
+  #       - S3WritePolicy:
+  #           BucketName: !Ref ProgrammeBucket
+  #       - DynamoDBCrudPolicy:
+  #           TableName: !Ref IdempotencyTable
+
+  # ── Idempotency table (Module 4+) ───────────────────────────────────────
+  # IdempotencyTable:
+  #   Type: AWS::DynamoDB::Table
+  #   Properties:
+  #     TableName: !Sub "idempotency_keys_${LearnerName}"
+  #     BillingMode: PAY_PER_REQUEST
+  #     AttributeDefinitions:
+  #       - AttributeName: pk
+  #         AttributeType: S
+  #     KeySchema:
+  #       - AttributeName: pk
+  #         KeyType: HASH
+  #     TimeToLiveSpecification:
+  #       AttributeName: ttl
+  #       Enabled: true
+
+  PlaceholderResource:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/accelya/${LearnerName}/m1-placeholder"
+      Type: String
+      Value: "Module 1 — SAM template scaffolded. No real resources yet."
+
+Outputs:
+  PlaceholderArn:
+    Description: SSM parameter ARN (placeholder for Module 1)
+    Value: !Ref PlaceholderResource
