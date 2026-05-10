@@ -133,19 +133,32 @@ def main() -> int:
     print("-" * 60)
 
     # Try to parse as JSON — Lab 1 success criterion.
+    # Accept any of these shapes (Claude returns slightly different shapes per run):
+    #   [{...}, {...}]                        — JSON array
+    #   {"options":      [{...}, {...}]}      — programme-recommended shape
+    #   {"architectures":[{...}, {...}]}      — common alternative
+    #   {"any_list_key": [{...}, {...}]}      — accept any top-level array of objects
     try:
         parsed = json.loads(reply_text)
         if isinstance(parsed, list) and len(parsed) >= 2:
             print()
             print(f"✅ Parsed as JSON array of {len(parsed)} architecture options.")
-        elif isinstance(parsed, dict) and "options" in parsed:
-            print()
-            print(f"✅ Parsed as JSON object with 'options' key "
-                  f"({len(parsed['options'])} options).")
+        elif isinstance(parsed, dict):
+            list_keys = [k for k, v in parsed.items()
+                         if isinstance(v, list) and len(v) >= 2
+                         and all(isinstance(x, dict) for x in v)]
+            if list_keys:
+                k = list_keys[0]
+                print()
+                print(f"✅ Parsed as JSON object with '{k}' key "
+                      f"({len(parsed[k])} architecture options).")
+            else:
+                print()
+                print("⚠  Parsed as JSON but no top-level list of options found. "
+                      "Inspect the reply.")
         else:
             print()
-            print("⚠  Parsed as JSON but shape is unexpected (not an array or "
-                  "{options:[]}). Inspect the reply.")
+            print("⚠  Parsed as JSON but shape is unexpected. Inspect the reply.")
     except json.JSONDecodeError as e:
         print()
         print("⚠  Reply is not valid JSON. The model may have wrapped it in "
