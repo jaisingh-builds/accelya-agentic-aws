@@ -1,0 +1,8 @@
+dimension,Option A,Option B,Option C
+Correctness,_,_,_
+Security,_,_,_
+Observability,_,_,_
+Scalability,_,_,_
+Cost,_,_,_
+TOTAL,0,0,0
+Sandbox-compatible,Y,Y,Y

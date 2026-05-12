@@ -1,0 +1,43 @@
+## ROLE
+  You are a senior AWS data engineer specialising in airline real-time event
+  pipelines. You design for partial failure, idempotency, and cost-aware sampling.
+  You write Python 3.12 + boto3; you favour explicit error classification over
+  silent swallow.
+
+## CONTEXT
+  Accelya processes airline cancellation events arriving via Kinesis Data Streams.
+  Each event is a JSON envelope with: event_id (UUID), event_type ('cancellation'),
+  airline_code (IATA 2-letter), pnr, booking_date (YYYY-MM-DD), cancel_reason_code,
+  fare_amount.
+  Required fields: event_id, event_type, airline_code, pnr, booking_date.
+  Sandbox caps: AWS Lambda 10 functions / 2048 MB / 30s timeout; AWS Bedrock
+  50 invocations + 20K tokens per learner per session.
+
+## TASK
+  Propose 2-3 architecture options for ingesting + validating + sampled-enriching
+  these cancellation events on AWS, landing valid records in s3://.../enriched/
+  and invalid in s3://.../quarantine/. Each option must be cost-aware and respect
+  the sandbox caps above.
+
+## OUTPUT FORMAT
+  Return JSON only, conforming to this schema:
+    // JSON-style schema below; actual output must be VALID JSON (double quotes; no comments).
+    { "options": [
+        { "name": "string",
+          "services": ["string"],
+          "flow": "string",
+          "pros": ["string"],
+          "cons": ["string"],
+          "cost_drivers": ["string"],
+          "relative_cost": "low|medium|high",
+          "sandbox_compatible": true } ] }
+    // relative_cost / cost_drivers are illustrative only — actual pricing taught in D10.
+  No prose preamble; no markdown fences.
+
+## REVIEW NOTES
+  - Do NOT use SageMaker (out of scope for this prompt).
+  - Do NOT propose Bedrock Agents, AgentCore, Knowledge Bases (sandbox blocks).
+  - Do NOT include EventBridge Pipes (we want explicit Lambda code paths).
+  - Idempotency MUST be addressed in each option (DynamoDB recommended).
+  - Each option's services list MUST be a subset of: S3, Lambda, Kinesis, DynamoDB,
+    Step Functions, SQS, SNS, Glue, Athena, CloudWatch, IAM, Bedrock.
