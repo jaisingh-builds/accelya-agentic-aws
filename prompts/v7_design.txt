@@ -1,0 +1,89 @@
+# prompts/v7_design.txt
+# 7-layer Cascade prompt for Day 4 Lab 1 — design doc generation.
+# Different from Day 3's 5-section prompt (REPO RULES + REVIEW added).
+# Fill ONLY the [TASK] section; leave the other 6 layers verbatim.
+
+## [LAYER 1] ROLE
+You are a senior AWS data architect specialising in airline batch pipelines on
+sandbox-constrained AWS environments. You have shipped production airline
+settlement pipelines on AWS. You write design docs that engineers can implement
+without further clarification.
+
+## [LAYER 2] REPO RULES
+- This is the cohort-shared repo: accelya-agentic-aws.
+- Each learner has a branch: module-4-<learner-name>.
+- All Lambdas: src/<component>/handler.py + tests/test_<component>.py.
+- ASL state machine definitions: infra/*.asl.json.
+- IaC: AWS SAM template at infra/template.yaml.
+- Region locked to ap-south-1; hardcoded in CLI examples; env var in code.
+- Audit folders: prompts/ reviews/ design/ — all committed.
+- Design docs live in design/m<N>-<topic>.md.
+
+## [LAYER 3] CONSTRAINTS
+- Bedrock: ≤ 50 invocations + ≤ 20,000 tokens per learner per session.
+- Bedrock invoke via APAC inference profile (not raw model ID):
+    apac.anthropic.claude-3-5-sonnet-20241022-v2:0
+- Bedrock FORBIDDEN in this sandbox: Agents, AgentCore, Knowledge Bases, Studio.
+- Lambda: ≤ 10 total per learner across programme; ≤ 2048 MB memory; python3.12; 60s timeout default.
+- SageMaker: ≤ 1 endpoint; no GPU instance types.
+- Glue: ≤ 3 jobs; ≤ 4 DPU total; ≤ 6 DPU-h cumulative.
+- DynamoDB: PAY_PER_REQUEST billing; no GSIs needed for idempotency.
+- IAM: NEVER s3:* or iam:*; NEVER Resource:"*"; ARN-scope every action; ListBucket via Condition.s3:prefix.
+- Region: ap-south-1 — every resource, every CLI example, every API call.
+
+## [LAYER 4] EXAMPLES
+Reference these as artefacts the design must integrate with:
+- Day 2 starter validator: src/validator/handler.py (deployed Lambda; D2 Lab 3 output).
+- Day 3 prompts: prompts/v1_arch_options.txt, prompts/v2_validator.txt.
+- Day 3 .windsurfrules v1-draft: at repo root.
+- Programme schema fields (mandatory): pnr, airline_code, fare_class, od_pair,
+  settlement_date, ticket_number, issue_date, fare_amount, currency, agency_iata,
+  source_system.
+- Forbidden vocabulary: order, order_id, user, user_id, transaction_amount, item.
+
+## [LAYER 5] TASK
+[FILL THIS SECTION ONLY — KEEP OTHER LAYERS VERBATIM]
+
+Author design/m4-batch-pipeline-design.md for the airline settlement batch
+pipeline. The doc must cover:
+
+  1. The four zones (raw/, validated/, quarantine/, curated/) — what each contains,
+     who writes, who reads, what the contract is.
+  2. The S3 layout with per-learner prefixes — write the actual path conventions.
+  3. The six failure modes (schema drift, partial write, duplicate ingest, late
+     event, malformed row, source outage) — name the catch point for each.
+  4. The four idempotency guards (row replay, file byte hash, canonical row-set
+     hash, business key) — specify ONE DynamoDB table schema with prefixed PKs.
+  5. The IAM-per-zone policy structure — show the policy excerpt for the pipeline
+     execution role (read raw/, write validated/, write quarantine/).
+  6. The data flow diagram (text-based) — BSP feed → S3 raw → Step Functions →
+     chunker → validator → lander → S3 validated/quarantine.
+  7. Cost guardrails: how the design respects the sandbox caps in CONSTRAINTS.
+
+## [LAYER 6] OUTPUT FORMAT
+Output a single Markdown file. Structure:
+
+  # M4 — Batch Pipeline Design
+
+  ## 1. Context (the problem this design solves)
+  ## 2. Four-zone S3 model (raw / validated / quarantine / curated)
+  ## 3. S3 layout (per-learner prefixes)
+  ## 4. Data flow (BSP feed → ... → validated/quarantine)
+  ## 5. Failure-mode catalogue (6 categories; named catch points)
+  ## 6. Idempotency strategy (4 guards in one DynamoDB table)
+  ## 7. IAM scoping (per-zone policy excerpt)
+  ## 8. Cost guardrails (how the design respects sandbox caps)
+
+Target length: 600-1200 words total. Each section ≤ 150 words.
+Use fenced code blocks for IAM JSON, DynamoDB schema, and CLI examples.
+No prose preamble. No conclusion section.
+
+## [LAYER 7] REVIEW
+This design will be HITL-reviewed on 5 dimensions before merge:
+- **Correctness** — zones, contracts, schema consistent with Concepts 1-3; failure modes match Concept 4; idempotency consistent with Concept 5.
+- **Security** — IAM excerpts are named-action-only; no s3:* anywhere; Conditions on ListBucket.
+- **Idempotency** — all 4 guards specified; DynamoDB schema correct; TTL strategy explicit.
+- **Observability** — design names correlation_id strategy; failure modes have named log lines.
+- **Cost** — TTL + PAY_PER_REQUEST capacity called out; partition strategy for curated/.
+
+Pass bar: ≥ 12/15 across dimensions AND each dim ≥ 2/3. Lower = revise.

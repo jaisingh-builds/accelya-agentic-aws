@@ -1,0 +1,71 @@
+# .windsurfrules — v1-final (Day 4 Lab 3 target state)
+#
+# This is the TARGET STATE for Lab 3. Learners promote yesterday's v1-draft to this v1-final.
+# Day 5 will add a BATCH CONTEXT block (v2 promotion).
+# Day 6 adds CATALOG CONTEXT (v3). Days 7-11 each add one more context layer.
+
+## REPO RULES
+- Lambdas: src/<component>/handler.py + tests/test_<component>.py
+- ASL state machines: infra/*.asl.json
+- IaC: infra/template.yaml (AWS SAM)
+- Audit folders (committed): prompts/ reviews/ design/
+- Region locked: ap-south-1; CLI examples hardcode, code uses env var (AWS_REGION)
+- Branches: module-N-<learner>; MRs only — no direct commits to main
+
+## CONSTRAINTS
+- Bedrock: invoke via APAC inference PROFILE (not raw model ID):
+    apac.anthropic.claude-3-5-sonnet-20241022-v2:0
+  In ap-south-1 the safe pattern is the cross-region inference profile.
+- Bedrock budget: max 50 invocations + 20,000 tokens per learner per session.
+- Bedrock FORBIDDEN in this sandbox: Studio, Knowledge Bases, Agents, AgentCore.
+- Lambda: max 10 functions per learner across programme; max 2048 MB memory;
+  runtime python3.12; default timeout 60s (modules may override per-lab —
+  e.g. SageMaker wrapper on D9, ETL on D6).
+- SageMaker: max 1 endpoint; provisioned: allowed CPU instance families only;
+  D9 uses Serverless (MemorySizeInMB + MaxConcurrency); NO GPU instances.
+- Glue: max 3 jobs; max 4 DPU total; max 6 DPU-hours cumulative; sessions disabled.
+- DynamoDB: PAY_PER_REQUEST billing for idempotency tables; no GSIs required.
+- FIS (Fault Injection): max 20 minutes action time per lab.
+- GitLab: Free tier only (no merged-results pipelines; manual cleanup-sandbox).
+- AWS Budgets: NOT supported in sandbox — use CW metric-math alarms.
+- Cost Explorer API: NOT enabled in sandbox — use CW metric proxies.
+
+## EXAMPLES
+- Cancellation envelope:
+    { event_id, event_type: 'cancellation', airline_code: 'AI', pnr: '6X7Y8Z',
+      booking_date: '2026-05-09', cancel_reason_code: 'WX', fare_amount: 2845.0 }
+- Settlement record:
+    { settlement_id: 'BSP-2026-W19-AI234-001', bsp_cycle: '2026-W19',
+      airline_code: 'AI', pnr: '6X7Y8Z', fare_class: 'Y', od_pair: 'BOM-LHR',
+      ticket_number: '098-1234567890', issue_date: '2026-05-08T11:42:00+05:30',
+      fare_amount: 2845.00, currency: 'INR', commission_pct: 0.07,
+      refund_status: null, agency_iata: '14305820', source_system: 'BSP' }
+- Quarantine sidecar JSON:
+    { reason: '<schema_drift|partial|malformed|business_rule_failed>',
+      source_file: '<s3 key>', line_no: <int>,
+      correlation_id: '<lambda request id>',
+      validator_version: '<semver>',
+      original_record: { ... } }
+- Idempotency table: idempotency_keys_<learner> — single table, 4 guards:
+    PK 'row#<file_key>:<line_no>'              (TTL 30d) — row replay
+    PK 'file#<file_sha256>'                    (TTL 90d) — file-byte duplicate
+    PK 'canonical#<canonical_manifest_hash>'   (TTL 90d) — row-set logical duplicate
+    PK 'business#<settlement_id>'              (TTL 30d) — business-key duplicate
+- IAM ListBucket: Condition.s3:prefix pattern, NOT Resource suffix
+    (raw/ and raw/* both — literal "raw/" matches top-level ListBucket; "raw/*" matches sub-prefixes)
+- Reference artefacts in this project: src/validator/handler.py (Day 2),
+  design/m4-batch-pipeline-design.md (Day 4 Lab 1), design/m4-failure-modes.md (Day 4 Lab 2)
+
+## REVIEW
+- Every Cascade-generated artefact passes 5-dim HITL checklist before merge:
+    Correctness · Security · Observability · Scalability · Cost
+- HITL_REVIEW-<artefact>.md filled per output + committed; PASS at >=12/15 AND every dim >=2/3
+- IAM: NEVER wildcards in Action or Resource; use named verbs + ARN-scoped resources
+- IAM: ListBucket scoped via Condition.s3:prefix (never via Resource suffix)
+- Logging: powertools Logger + correlation_id (extracted via correlation_id_path);
+  structured JSON only; NEVER print() in code paths
+- Errors: classified into PipelineError ladder (SchemaError, ReferenceError,
+  BusinessRuleError, TransientError, ConfigError); NEVER bare 'except: pass'
+- Idempotency: 4 guards in one DynamoDB table with prefixed PKs (see EXAMPLES)
+- Region: every CLI example uses --region ap-south-1; every code path reads from env var
+- Synthetic data only: no real customer / production data anywhere in committed artefacts
