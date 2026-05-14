@@ -78,26 +78,36 @@ git push -u origin module-4-<your-name>
 ### Steps
 
 ```bash
-# 1. List the synthetic broken files (trainer-provided)
-aws s3 ls \
-  s3://accelya-airline-data-ap-south-1/raw/synthetic/m4-failures/ \
-  --region ap-south-1
+# 1. The synthetic broken files are already in the repo at data/m4-failures/
+#    (no S3 round-trip required — the files live in git for reproducibility).
+ls data/m4-failures/
 
-# Expected files:
+# Expected:
 #   01-schema-drift.json
 #   02-partial.json
 #   03-duplicate.json
 #   04-late-event.json
 #   05-malformed.json
+#   README.md
 # (06 source-outage is DESIGN-ONLY — no file)
 
-# 2. Pull each file locally for inspection
-mkdir -p design/m4-broken
-for f in 01-schema-drift 02-partial 03-duplicate 04-late-event 05-malformed; do
-  aws s3 cp \
-    s3://accelya-airline-data-ap-south-1/raw/synthetic/m4-failures/$f.json \
-    design/m4-broken/$f.json --region ap-south-1
-done
+# 2. Inspect each file
+#    Open them in Windsurf, or use CLI quickies:
+
+# 01 — valid JSON; row 47 has wrong field; row 89 has string instead of number
+python3 -c "import json; r=json.load(open('data/m4-failures/01-schema-drift.json')); print('row 47 keys:', list(r[47].keys())); print('row 89 fare_amount type:', type(r[89]['fare_amount']).__name__)"
+
+# 02 — won't parse (intentionally truncated)
+python3 -c "import json; json.load(open('data/m4-failures/02-partial.json'))" 2>&1 | head -3
+
+# 03 — byte-identical to 01 (file_sha256 duplicate)
+diff data/m4-failures/01-schema-drift.json data/m4-failures/03-duplicate.json && echo "FILES IDENTICAL"
+
+# 04 — issue_date 95 days ago
+python3 -c "import json; print(json.load(open('data/m4-failures/04-late-event.json'))[0]['issue_date'])"
+
+# 05 — multiple parse errors
+python3 -c "import json; json.load(open('data/m4-failures/05-malformed.json'))" 2>&1 | head -3
 
 # 3. Categorise + trace one file end-to-end
 #    For each file, identify:
@@ -130,7 +140,16 @@ git push
 
 - **Put 03 or 04 in quarantine** — re-read Concept 4. Duplicates = DDB no-op. Late events = `validated/` with flag.
 - **Source-outage section uses same structure as file-based** — wrong. It has a different structure: no catch point in a Lambda; the catch is an EventBridge schedule.
-- **Synthetic files missing** — trainer ran `seed_m4_synthetic_failures.sh`? If empty, ask trainer to seed.
+- **Files accidentally modified** — `data/m4-failures/` is read-only by convention. If you broke a file: `python3 scripts/generate_m4_failures.py` regenerates them.
+
+### Regenerating the files
+
+If `data/m4-failures/` ever needs to be regenerated (you modified a file by accident, or you want a fresh `04-late-event.json` with today's "95 days ago" date):
+
+```bash
+python3 scripts/generate_m4_failures.py
+# Writes all 5 files. Idempotent — files 01/02/03/05 reproduce identically; 04 shifts with today's date.
+```
 
 ---
 

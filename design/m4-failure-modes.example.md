@@ -8,7 +8,7 @@
 ## 01 — Schema drift
 
 ### Synthetic file
-`s3://accelya-airline-data-ap-south-1/raw/synthetic/m4-failures/01-schema-drift.json`
+`data/m4-failures/01-schema-drift.json`
 
 ### What's broken
 Row 47 has `fare_currency` instead of `currency`. Row 89 has `fare_amount: "2845.0"` (string instead of number).
@@ -49,7 +49,7 @@ Row 47 has `fare_currency` instead of `currency`. Row 89 has `fare_amount: "2845
 ## 02 — Partial write
 
 ### Synthetic file
-`s3://accelya-airline-data-ap-south-1/raw/synthetic/m4-failures/02-partial.json`
+`data/m4-failures/02-partial.json`
 
 ### What's broken
 File is truncated mid-row (drops at row 31 of 100). JSON parser fails on EOF in middle of object.
@@ -88,7 +88,7 @@ File is truncated mid-row (drops at row 31 of 100). JSON parser fails on EOF in 
 ## 03 — Duplicate ingest
 
 ### Synthetic file
-`s3://accelya-airline-data-ap-south-1/raw/synthetic/m4-failures/03-duplicate.json`
+`data/m4-failures/03-duplicate.json`
 
 ### What's broken
 Nothing is "broken" — the file is a byte-identical re-send of an earlier file already processed.
@@ -117,7 +117,7 @@ Usually none — duplicates are normal (retries, re-sends, network drops). Audit
 ## 04 — Late event
 
 ### Synthetic file
-`s3://accelya-airline-data-ap-south-1/raw/synthetic/m4-failures/04-late-event.json`
+`data/m4-failures/04-late-event.json`
 
 ### What's broken
 Nothing is "broken" — rows are valid, fields parse correctly, business rules pass. But `issue_date` is 95 days ago; `event_date` is today's `ingest_date`.
@@ -144,7 +144,7 @@ Usually none — late events are normal in airline data (90-day refund window). 
 ## 05 — Malformed row
 
 ### Synthetic file
-`s3://accelya-airline-data-ap-south-1/raw/synthetic/m4-failures/05-malformed.json`
+`data/m4-failures/05-malformed.json`
 
 ### What's broken
 Row 14 has unescaped quotes inside a string field. Row 67 has trailing comma. Row 88 has UTF-16 byte sequence in the middle of a UTF-8 file.
