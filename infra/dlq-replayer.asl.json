@@ -1,0 +1,67 @@
+{
+  "Comment": "Day 5 Lab 3 — reusable DLQ replayer. DrainDLQ -> Classify -> NotifyOps (if config-errors present) -> Done. Render placeholders via envsubst before create-state-machine.",
+  "StartAt": "DrainDLQ",
+  "TimeoutSeconds": 300,
+  "States": {
+    "DrainDLQ": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:accelya-dlq-replayer-${LEARNER}",
+        "Payload": { "max_messages": 100 }
+      },
+      "OutputPath": "$.Payload",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["ConfigError"],
+          "ResultPath": "$.error",
+          "Next": "NotifyOps"
+        }
+      ],
+      "Next": "Classify"
+    },
+
+    "Classify": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.config_count",
+          "NumericGreaterThan": 0,
+          "Next": "NotifyOps"
+        }
+      ],
+      "Default": "Done"
+    },
+
+    "NotifyOps": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:accelya-pipeline-escalations-${LEARNER}",
+        "Subject": "DLQ replayer — config-class messages observed",
+        "Message.$": "States.JsonToString($)"
+      },
+      "ResultPath": "$.notify_result",
+      "End": true
+    },
+
+    "Done": {
+      "Type": "Pass",
+      "Result": { "outcome": "drained_clean" },
+      "End": true
+    }
+  }
+}

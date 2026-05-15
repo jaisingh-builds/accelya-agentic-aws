@@ -1,0 +1,180 @@
+{
+  "Comment": "Day 5 Lab 1 — main validator pipeline. 3 Lambda Tasks + 2 control states + 4 Catch routes. ASL invokes Lambdas directly (no SQS in main path). Render placeholders via envsubst before create-state-machine.",
+  "StartAt": "Chunk",
+  "TimeoutSeconds": 900,
+  "States": {
+    "Chunk": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:accelya-chunker-${LEARNER}",
+        "Payload.$": "$"
+      },
+      "OutputPath": "$.Payload",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        },
+        {
+          "ErrorEquals": ["States.Timeout"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["MalformedRowError"],
+          "ResultPath": "$.error",
+          "Next": "QuarantineMalformed"
+        },
+        {
+          "ErrorEquals": ["ConfigError"],
+          "ResultPath": "$.error",
+          "Next": "NotifyOps"
+        }
+      ],
+      "Next": "HasRows"
+    },
+
+    "HasRows": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.row_count",
+          "NumericGreaterThan": 0,
+          "Next": "Validate"
+        }
+      ],
+      "Default": "NoRows"
+    },
+
+    "Validate": {
+      "Type": "Map",
+      "ItemsPath": "$.chunk_keys",
+      "MaxConcurrency": 4,
+      "ItemSelector": {
+        "chunk_key.$": "$$.Map.Item.Value",
+        "file_key.$": "$.file_key",
+        "file_sha256.$": "$.file_sha256"
+      },
+      "ItemProcessor": {
+        "ProcessorConfig": { "Mode": "INLINE" },
+        "StartAt": "ValidateChunk",
+        "States": {
+          "ValidateChunk": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": {
+              "FunctionName": "arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:accelya-validator-${LEARNER}",
+              "Payload.$": "$"
+            },
+            "OutputPath": "$.Payload",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException",
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 3,
+                "BackoffRate": 2.0
+              }
+            ],
+            "End": true
+          }
+        }
+      },
+      "ResultPath": "$.validation_results",
+      "Catch": [
+        {
+          "ErrorEquals": ["ValidationError"],
+          "ResultPath": "$.error",
+          "Next": "QuarantineSchemaDrift"
+        },
+        {
+          "ErrorEquals": ["ConfigError"],
+          "ResultPath": "$.error",
+          "Next": "NotifyOps"
+        }
+      ],
+      "Next": "Land"
+    },
+
+    "Land": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:accelya-lander-${LEARNER}",
+        "Payload.$": "$"
+      },
+      "OutputPath": "$.Payload",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["ManifestMismatchError"],
+          "ResultPath": "$.error",
+          "Next": "QuarantinePartial"
+        },
+        {
+          "ErrorEquals": ["ConfigError"],
+          "ResultPath": "$.error",
+          "Next": "NotifyOps"
+        }
+      ],
+      "End": true
+    },
+
+    "NoRows": {
+      "Type": "Pass",
+      "Result": { "outcome": "empty_input" },
+      "End": true
+    },
+
+    "QuarantineSchemaDrift": {
+      "Type": "Pass",
+      "Result": { "outcome": "quarantined", "reason": "schema_drift" },
+      "End": true
+    },
+
+    "QuarantinePartial": {
+      "Type": "Pass",
+      "Result": { "outcome": "quarantined", "reason": "partial" },
+      "End": true
+    },
+
+    "QuarantineMalformed": {
+      "Type": "Pass",
+      "Result": { "outcome": "quarantined", "reason": "malformed" },
+      "End": true
+    },
+
+    "NotifyOps": {
+      "Type": "Fail",
+      "Error": "PipelineEscalation",
+      "Cause": "Pipeline halted; see $.error for details. Manual operator action required."
+    }
+  }
+}

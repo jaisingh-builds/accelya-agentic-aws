@@ -1,0 +1,90 @@
+# Day 5 Lab 3 — Cascade prompt template for the DLQ replayer Lambda
+# 5-section prompt: ROLE · REPO RULES · TASK · OUTPUT FORMAT · REVIEW
+
+[LAYER 1] ROLE
+You are an AWS-native Python engineer authoring a reusable DLQ replayer
+Lambda. The same binary will be reused across modules (Lab 2 test DLQ
+today; Day 7-8 streaming DLQs later). Fully env-driven.
+
+[LAYER 2] REPO RULES
+- Read .windsurfrules at repo root before generating.
+- This Lambda is invoked manually via Step Functions today; EventBridge
+  schedule rule every 15 min in production.
+- File path: src/dlq_replayer/handler.py
+- Tests path: tests/test_dlq_replayer.py
+
+[LAYER 3] TASK
+Author src/dlq_replayer/handler.py with the following contract:
+
+EVENT IN:
+    { "max_messages": <int, default 100, hard-capped at 100> }
+
+RETURN OUT:
+    { "transient_count":     <int>,
+      "data_count":          <int>,
+      "config_count":        <int>,
+      "processed_count":     <int>,
+      "remaining_estimate":  <int>   (-1 if unknowable) }
+
+CLASSIFIER (3 buckets off `error_type` MessageAttribute):
+    TRANSIENT_TYPES = {
+        "TransientError", "ThrottledError", "ThrottlingException",
+        "TimeoutError", "DependencyTimeoutError", "ServiceUnavailable"
+    }
+    DATA_TYPES = {
+        "SchemaError", "ManifestMismatchError", "MalformedRowError",
+        "ValidationError", "ReferenceError", "TypeMismatchError"
+    }
+    everything else → config
+
+ROUTING:
+- transient + replay_attempt < 3
+    → sqs.send_message to MAIN_QUEUE_URL with body unchanged,
+      MessageAttributes preserved BUT replay_attempt incremented,
+      first_seen_at added if missing.
+- transient + replay_attempt >= 3
+    → escalate as config (sns.publish, reason="transient_replay_cap_exceeded").
+- data
+    → s3.put_object to quarantine/dlq_data/<learner>/<message_id>.json
+      with full envelope (body + MessageAttributes + correlation id).
+- config
+    → sns.publish to ESCALATION_TOPIC with full envelope, reason="config_error".
+- IN ALL CASES: sqs.delete_message from DLQ_URL AFTER the action succeeds.
+
+BEHAVIOUR:
+- Loop sqs.receive_message (MaxNumberOfMessages=10, WaitTimeSeconds=2,
+  MessageAttributeNames=["All"]) until either:
+    (a) no messages returned, or
+    (b) processed_count >= max_messages.
+- Hard cap: max_messages must NOT exceed HARD_CAP = 100.
+- Don't raise on individual message action failure — log + continue;
+  unreleased visibility will resurface the message naturally.
+
+ENV VARS REQUIRED:
+- DLQ_URL              source DLQ
+- MAIN_QUEUE_URL       redrive target for transient
+- ESCALATION_TOPIC     SNS topic ARN for config
+- QUARANTINE_BUCKET    S3 bucket for data-error persistence
+- LEARNER              learner name suffix
+- (raise ConfigError if any missing)
+
+LOGGING:
+- JSON with corr_id.
+- Key events: replayer_start, replayer_message (per message with classification),
+  replayer_action_failed (warn), replayer_done (with totals).
+
+[LAYER 4] OUTPUT FORMAT
+- handler(event, context) signature.
+- Type hints: Python 3.12.
+- Imports: stdlib + boto3 only.
+- Tests using moto (SQS + S3 + SNS).
+
+[LAYER 5] REVIEW
+Self-grade on 5 dimensions:
+- Correctness: classifier ORDER strict (transient before data before config);
+  replay_attempt cap honoured.
+- Security: ESCALATION_TOPIC ARN read from env; no email addresses hardcoded.
+- Observability: every action emits a distinct event name; per-message log.
+- Scalability: 100-message hard cap bounds invocation time.
+- Cost: sqs.receive_message uses WaitTimeSeconds=2 (long polling) to reduce
+  empty-receive cost.

@@ -1,0 +1,79 @@
+# Day 5 Lab 1 — Cascade prompt template for the M5 validator Lambda
+# 5-section prompt: ROLE · REPO RULES · TASK · OUTPUT FORMAT · REVIEW
+
+[LAYER 1] ROLE
+You are an AWS-native Python engineer authoring the row-level idempotency-
+aware validator stage of the validator-pipeline state machine.
+
+[LAYER 2] REPO RULES
+- Read .windsurfrules at repo root before generating.
+- Use ASL CHUNK CONTEXT — NOT SQS PARTIAL-BATCH CONTEXT.
+- File path: src/validator_m5/handler.py
+  (NOT src/validator/handler.py — that's Day 2's direct-S3-trigger handler.)
+- Tests path: tests/test_validator_m5.py
+- Idempotency table: idempotency_keys_<learner>; prefixes "row#" + "business#"
+  belong to this stage (the lander owns "file#" + "canonical#").
+
+[LAYER 3] TASK
+Author src/validator_m5/handler.py with the following contract:
+
+EVENT IN (built by the Map state's ItemSelector):
+    { "chunk_key":   "staging/<learner>/<sha>/chunk-NNNN.jsonl",
+      "file_key":    "<original raw key>",
+      "file_sha256": "<64-hex>" }
+
+RETURN OUT:
+    { "validated":   <int>,
+      "quarantined": <int>,
+      "duplicate":   <int>,
+      "chunk_key":   <input>,
+      "file_key":    <input>,
+      "file_sha256": <input> }
+
+PER-ROW CONTRACT (in this exact order):
+1. Claim row#<file_key>:<line_no>  (TTL 30 d) via DynamoDB conditional put.
+   If duplicate → counts.duplicate += 1; continue.
+2. Schema-validate against REQUIRED_FIELDS:
+   {settlement_id, bsp_cycle, airline_code, pnr, fare_class, od_pair,
+    ticket_number, issue_date, fare_amount, currency, agency_iata,
+    source_system}.
+   On miss → raise SchemaError; the handler catches it, writes a sidecar to
+   quarantine/schema_drift/<learner>/<safe_file_key>:<line_no>.sidecar.json,
+   counts.quarantined += 1, continue.
+3. fare_amount must be int|float; otherwise SchemaError (same handling).
+4. Compute biz_key = settlement_id (or composite fallback:
+   ticket_number|bsp_cycle|agency_iata|fare_amount).
+   Claim business#<biz_key> (TTL 30 d). Duplicate → counts.duplicate += 1; continue.
+5. Append row to validated_rows buffer.
+
+AFTER PROCESSING ALL ROWS:
+- Persist validated_rows to
+  "validated/<learner>/<bsp_cycle-of-first-row>/<chunk_id>.jsonl".
+- Whole-chunk verdict: if (quarantined / (validated + quarantined)) > 0.5
+  → raise ValidationError (ASL Catch routes to QuarantineSchemaDrift).
+
+ENV VARS REQUIRED:
+- STAGING_BUCKET, LEARNER, IDEMP_TABLE (raise ConfigError on miss).
+
+ERRORS RAISED:
+- ValidationError  → QuarantineSchemaDrift   (whole-chunk threshold)
+- ConfigError      → NotifyOps               (env missing)
+- (SchemaError is CAUGHT internally, not raised to ASL.)
+
+LOGGING:
+- JSON; corr_id on every line.
+- Key events: validator_start, validator_done with counts.
+
+[LAYER 4] OUTPUT FORMAT
+- handler(event, context) signature.
+- Type hints: Python 3.12.
+- Imports: stdlib + boto3 only.
+- Tests using moto for both S3 + DynamoDB.
+
+[LAYER 5] REVIEW
+Self-grade on 5 dimensions:
+- Correctness: row order preserved; row#-then-schema-then-business# order strict.
+- Security: idempotency table reads via env, never hardcoded.
+- Observability: every quarantine emits a structured WARN log.
+- Scalability: one DDB call per row x 2 guards = 2N calls; document the cost.
+- Cost: validated buffer kept in memory; if chunks could be larger, stream-write.

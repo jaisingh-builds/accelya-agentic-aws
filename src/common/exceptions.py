@@ -46,13 +46,39 @@ __all__ = [
     "ConfigError",
     "MissingEnvVarError",
     "MalformedRowError",
+    "ManifestMismatchError",
 ]
 
 
 class PipelineError(Exception):
-    """Base class for every typed error raised by programme code."""
+    """Base class for every typed error raised by programme code.
+
+    Carries structured context so ASL Catch handlers + DLQ replayer can
+    classify without parsing the message string.
+
+    Day 5+ handlers raise with kwargs:
+        raise SchemaError("missing fare_amount", file_key=..., line_no=...)
+
+    Day 2-4 callers that pass only a positional message still work because
+    every kwarg is optional and defaults to None.
+    """
 
     quarantine_reason: str = "pipeline_error"   # subclasses override
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        file_key: str | None = None,
+        line_no: int | None = None,
+        chunk_id: str | None = None,
+        detail: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.file_key = file_key
+        self.line_no = line_no
+        self.chunk_id = chunk_id
+        self.detail = detail
 
 
 # ── Validation ────────────────────────────────────────────────────────────
@@ -116,3 +142,13 @@ class MissingEnvVarError(ConfigError):
 class MalformedRowError(ConfigError):
     """Input file unparseable (not JSON, not valid CSV)."""
     quarantine_reason = "malformed"
+
+
+# ── Manifest mismatch (Day 5 — lander) ────────────────────────────────────
+class ManifestMismatchError(PipelineError):
+    """Lander manifest row_count != aggregated validated+quarantined+duplicate.
+
+    Raised by `src/lander/handler.py` when chunk-level results don't reconcile
+    to the chunker's reported `row_count`. ASL Catch routes to QuarantinePartial.
+    """
+    quarantine_reason = "partial"

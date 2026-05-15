@@ -1,0 +1,73 @@
+# Day 5 Lab 1 — Cascade prompt template for the lander Lambda
+# 5-section prompt: ROLE · REPO RULES · TASK · OUTPUT FORMAT · REVIEW
+
+[LAYER 1] ROLE
+You are an AWS-native Python engineer authoring the file-level finalisation
+Lambda of the validator-pipeline state machine.
+
+[LAYER 2] REPO RULES
+- Read .windsurfrules at repo root before generating.
+- Use ASL CHUNK CONTEXT — NOT SQS PARTIAL-BATCH CONTEXT.
+- File path: src/lander/handler.py
+- Tests path: tests/test_lander.py
+- Idempotency table: idempotency_keys_<learner>; prefixes "file#" + "canonical#"
+  belong to this stage.
+
+[LAYER 3] TASK
+Author src/lander/handler.py with the following contract:
+
+EVENT IN (parent state preserved by ResultPath: $.validation_results):
+    { "file_key":           "<from chunker>",
+      "file_sha256":        "<from chunker>",
+      "row_count":          <int from chunker>,
+      "chunk_keys":         [...],
+      "validation_results": [
+          { "validated": <int>, "quarantined": <int>, "duplicate": <int>,
+            "chunk_key": "...", "file_key": "...", "file_sha256": "..." }, ...
+      ] }
+
+RETURN OUT:
+    { "manifest_key": "validated/<learner>/_manifests/<file_sha256>.json"
+                       | null (if duplicate or empty),
+      "totals":       { "validated", "quarantined", "duplicate" },
+      "outcome":      "landed" | "duplicate_skipped" | "empty_after_validation" }
+
+BEHAVIOUR:
+1. Aggregate validation_results into totals by summing each key.
+2. accounted = validated + quarantined + duplicate.
+3. If row_count is provided AND accounted != row_count
+   → raise ManifestMismatchError (ASL Catch routes to QuarantinePartial).
+4. If accounted == 0 → return outcome="empty_after_validation"; no manifest.
+5. Claim file#<file_sha256> (TTL 90 d). On duplicate → outcome="duplicate_skipped".
+6. Compute canonical_manifest_hash over sorted chunk_keys (reference impl).
+   Claim canonical#<hash> (TTL 90 d). On duplicate → outcome="duplicate_skipped".
+7. Write manifest JSON to validated/<learner>/_manifests/<file_sha256>.json
+   with fields: manifest_version, file_key, file_sha256, canonical_manifest_hash,
+   totals, chunk_keys, outcome, landed_at, correlation_id.
+
+ENV VARS REQUIRED:
+- STAGING_BUCKET, LEARNER, IDEMP_TABLE (raise ConfigError on miss).
+
+ERRORS RAISED:
+- ManifestMismatchError → QuarantinePartial
+- ConfigError           → NotifyOps
+
+LOGGING:
+- JSON with corr_id.
+- Key events: lander_start, lander_duplicate_file, lander_duplicate_canonical,
+  lander_empty, lander_done.
+
+[LAYER 4] OUTPUT FORMAT
+- handler(event, context) signature.
+- Type hints: Python 3.12.
+- Imports: stdlib + boto3 only.
+- Tests using moto.
+
+[LAYER 5] REVIEW
+Self-grade on 5 dimensions:
+- Correctness: empty/duplicate/landed all three reachable in tests.
+- Security: manifest contains corr_id but no PII.
+- Observability: distinct event names per outcome.
+- Scalability: aggregation is O(chunks); no per-row work.
+- Cost: 0-2 DDB calls (file# always; canonical# only if file# succeeds);
+  1 manifest write only on landing.

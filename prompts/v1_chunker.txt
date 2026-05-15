@@ -1,0 +1,69 @@
+# Day 5 Lab 1 — Cascade prompt template for the chunker Lambda
+# 5-section prompt: ROLE · REPO RULES · TASK · OUTPUT FORMAT · REVIEW
+# Cascade also reads .windsurfrules v2 — do NOT duplicate v2 content here.
+
+[LAYER 1] ROLE
+You are an AWS-native Python engineer authoring a Step Functions Task Lambda.
+You write production-quality handlers consistent with the programme's
+PipelineError ladder and idempotency contract.
+
+[LAYER 2] REPO RULES
+- Read .windsurfrules at repo root before generating.
+- Use ASL CHUNK CONTEXT in .windsurfrules — NOT SQS PARTIAL-BATCH CONTEXT.
+- File path: src/chunker/handler.py
+- Tests path: tests/test_chunker.py
+- Region: ap-south-1; read from AWS_REGION env var.
+
+[LAYER 3] TASK
+Author src/chunker/handler.py with the following contract:
+
+EVENT IN:
+    { "file_key": "<s3 key relative to STAGING_BUCKET>" }
+
+RETURN OUT:
+    {
+      "file_key":    <input>,
+      "file_sha256": "<64-hex>",
+      "row_count":   <int>,
+      "chunk_keys":  ["staging/<learner>/<file_sha256>/chunk-NNNN.jsonl", ...]
+    }
+
+BEHAVIOUR:
+1. boto3.s3.get_object(STAGING_BUCKET, file_key)  — raise MalformedRowError
+   on NoSuchKey or unparseable body.
+2. Compute file_sha256 over the raw bytes (SHA-256 hex).
+3. json.loads the body; must be a top-level list of objects, else
+   MalformedRowError.
+4. Slice into chunks of CHUNK_SIZE rows (default 200, env-overridable).
+5. For each chunk: s3.put_object to
+   "staging/<learner>/<file_sha256>/chunk-NNNN.jsonl"  (one JSON object per line).
+6. Return the contract.
+
+ENV VARS REQUIRED:
+- STAGING_BUCKET   (raise ConfigError if missing)
+- LEARNER          (raise ConfigError if missing)
+- STAGING_PREFIX   (default "staging")
+- CHUNK_SIZE       (default 200)
+
+ERRORS RAISED:
+- MalformedRowError  → ASL Catch routes to QuarantineMalformed
+- ConfigError        → ASL Catch routes to NotifyOps
+
+LOGGING:
+- structured JSON via the standard logging module (powertools optional later).
+- include corr_id = context.aws_request_id on every line.
+- key events: chunker_start, chunker_done.
+
+[LAYER 4] OUTPUT FORMAT
+- handler(event, context) signature.
+- Type hints: Python 3.12 (`from __future__ import annotations`).
+- Imports: stdlib + boto3 only. No urllib3, no requests.
+- Tests in tests/test_chunker.py using moto for S3 mocking.
+
+[LAYER 5] REVIEW
+After generation, self-grade on 5 dimensions:
+- Correctness: handles 0-row file gracefully; chunk count = ceil(N / CHUNK_SIZE).
+- Security: no hardcoded ARNs, no wildcard reads.
+- Observability: every log line is JSON-structured with corr_id.
+- Scalability: streams body lazily if possible.
+- Cost: no unnecessary S3 list operations; one get_object per file.
