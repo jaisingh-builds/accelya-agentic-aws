@@ -1,0 +1,186 @@
+# .windsurfrules — v2 (Day 5 Lab 1 target state)
+#
+# Two blocks added between CONSTRAINTS and EXAMPLES:
+#   - ASL CHUNK CONTEXT          (Lab 1 — main pipeline, ASL invokes Lambdas DIRECTLY)
+#   - SQS PARTIAL-BATCH CONTEXT  (Lab 2 — standalone teaching demo, ESM-triggered)
+# Day 6 adds CATALOG CONTEXT → v3. Days 7-11 each add one more context layer.
+
+## REPO RULES
+- Lambdas: src/<component>/handler.py + tests/test_<component>.py
+- ASL state machines: infra/*.asl.json
+- IaC: infra/template.yaml (AWS SAM)
+- Audit folders (committed): prompts/ reviews/ design/
+- Region locked: ap-south-1; CLI examples hardcode, code uses env var (AWS_REGION)
+- Branches: module-N-<learner>; MRs only — no direct commits to main
+
+## CONSTRAINTS
+- Bedrock: invoke via APAC inference PROFILE (not raw model ID):
+    apac.anthropic.claude-3-5-sonnet-20241022-v2:0
+  In ap-south-1 the safe pattern is the cross-region inference profile.
+- Bedrock budget: max 50 invocations + 20,000 tokens per learner per session.
+- Bedrock FORBIDDEN in this sandbox: Studio, Knowledge Bases, Agents, AgentCore.
+- Lambda: max 10 functions per learner across programme; max 2048 MB memory;
+  runtime python3.12; default timeout 60s (modules may override per-lab —
+  e.g. SageMaker wrapper on D9, ETL on D6).
+- SageMaker: max 1 endpoint; provisioned: allowed CPU instance families only;
+  D9 uses Serverless (MemorySizeInMB + MaxConcurrency); NO GPU instances.
+- Glue: max 3 jobs; max 4 DPU total; max 6 DPU-hours cumulative; sessions disabled.
+- DynamoDB: PAY_PER_REQUEST billing for idempotency tables; no GSIs required.
+- FIS (Fault Injection): max 20 minutes action time per lab.
+- GitHub: public starter repo; MRs only; manual cleanup-sandbox after each module.
+- AWS Budgets: NOT supported in sandbox — use CW metric-math alarms.
+- Cost Explorer API: NOT enabled in sandbox — use CW metric proxies.
+- Step Functions: 256 KiB execution state limit. NEVER pass `rows[]` through state;
+  chunks live in S3 staging, only chunk_keys travel through ASL.
+
+## ASL CHUNK CONTEXT
+# Use this block when Cascade scaffolds Lambdas that ASL invokes DIRECTLY
+# (no SQS ESM in between). Applies to: chunker, validator, lander.
+
+- Invocation model: Step Functions Task -> Lambda. Event payload is the ASL state.
+- NEVER `event['Records']` in this context — that's the SQS PARTIAL-BATCH block.
+- Chunker event shape (from raw key): { file_key }
+- Chunker return shape: { file_key, file_sha256, row_count, chunk_keys: [...] }
+- Validator event shape (Map ItemSelector): { chunk_key, file_key, file_sha256 }
+- Validator return shape: { validated: N, quarantined: M, duplicate: K,
+                            chunk_key, file_key, file_sha256 }
+- Lander event shape: { file_key, file_sha256, chunk_keys: [...], validation_results: [...] }
+- Lander return shape: { manifest_key, totals, outcome }
+- Chunk bodies live ONLY in S3 at:
+    s3://<bucket>/staging/<learner>/<file_sha256>/chunk-<NNNN>.jsonl
+- Per-row contract inside validator:
+    1. Claim row#<file_key>:<line_no>            (TTL 30d)   -> skip if duplicate
+    2. Schema-validate                           (raise SchemaError on fail)
+    3. Claim business#<settlement_id>            (TTL 30d)   -> skip if duplicate
+    4. Persist row to s3://.../validated/<learner>/
+- Whole-chunk verdicts that route to ASL Catch:
+    ValidationError       -> QuarantineSchemaDrift   (>50% rows fail in chunk)
+    ManifestMismatchError -> QuarantinePartial       (lander mismatch)
+    MalformedRowError     -> QuarantineMalformed     (chunker only)
+    ConfigError           -> NotifyOps               (missing env var / IAM denial)
+- Idempotency claims by stage (single DynamoDB table idempotency_keys_<learner>):
+    Validator owns: row#<file_key>:<line_no>     +  business#<settlement_id>
+    Lander    owns: file#<file_sha256>           +  canonical#<canonical_manifest_hash>
+- Every Lambda Task in ASL MUST have:
+    Resource:    "arn:aws:states:::lambda:invoke"
+    Parameters:  { FunctionName: <arn>, "Payload.$": "$" }
+    OutputPath:  "$.Payload"
+    Retry:       [{ ErrorEquals: ["Lambda.TooManyRequestsException"],
+                    IntervalSeconds: 2, MaxAttempts: 3, BackoffRate: 2.0 }]
+    Catch:       array with named exceptions; every Catch has ResultPath: "$.error"
+- Map state requirements (Validate fan-out over chunk_keys):
+    ItemsPath:     "$.chunk_keys"
+    ItemSelector:  { "chunk_key.$": "$$.Map.Item.Value",
+                     "file_key.$": "$.file_key",
+                     "file_sha256.$": "$.file_sha256" }
+    MaxConcurrency: 4
+    ResultPath:    "$.validation_results"     (preserves parent state for Land)
+- Choice gate "HasRows" short-circuits empty inputs to "NoRows" Pass state.
+- ASL ARNs use ${LEARNER} + ${AWS::AccountId} + ${AWS::Region} placeholders
+  rendered via envsubst at create-state-machine time. NEVER hardcoded ARNs.
+
+## SQS PARTIAL-BATCH CONTEXT
+# Use this block when Cascade scaffolds Lambdas that SQS triggers via ESM.
+# Applies to: m5-test-validator (Lab 2 standalone demo only).
+# NOT used by main pipeline today (main pipeline is ASL-direct).
+
+- Invocation model: SQS Event Source Mapping -> Lambda. Event has Records[].
+- Event shape: { Records: [{ messageId, body, messageAttributes, ... }, ...] }
+- Body shape (JSON-stringified): { file_key, line_no, row, mode? }
+- BatchSize: 10 (max); MaximumBatchingWindowInSeconds: 5
+- VisibilityTimeout on queue: 6 * Lambda timeout + window
+    e.g. Lambda timeout 10s -> VisibilityTimeout 65s = 6*10 + 5
+- ScalingConfig.MaximumConcurrency: cap at 5 (Lab 2 demo)
+- ESM must use FunctionResponseTypes: [ReportBatchItemFailures]
+- Handler iterates Records; collects failures; returns:
+    { "batchItemFailures": [{ "itemIdentifier": "<messageId>" }] }
+- CRITICAL: batchItemFailures is ONLY for infrastructure / transient failures.
+    Row-level schema failures -> QUARANTINE the row, ACK the message.
+    Quarantine is NOT a failure.
+- Producer attaches MessageAttributes BEFORE send:
+    error_type:        StringValue  (e.g. "TransientError" when mode=force_transient)
+    replay_attempt:    StringValue  (Number-as-string, default "0")
+    first_seen_at:     StringValue  (ISO timestamp)
+    original_message_id: StringValue
+- DLQ policy on queue:
+    RedrivePolicy: { deadLetterTargetArn: <test-dlq-arn>, maxReceiveCount: 3 }
+- DLQ visibility 30s; DLQ message retention 14 days (1209600s).
+- The DLQ replayer (Lab 3) reads error_type from MessageAttributes (NOT the message body).
+- Per-row contract inside handler (same as ASL CHUNK CONTEXT):
+    1. Claim row#<file_key>:<line_no>            (TTL 30d)
+    2. Schema-validate
+    3. Claim business#<settlement_id>            (TTL 30d)
+    4. Persist to validated/
+- Failure classification inside handler:
+    transient errors  -> append to failures, raise nothing, SQS retries
+    schema errors     -> write to quarantine/, DO NOT add to failures
+    config errors     -> log + escalate via SNS, DO NOT add to failures
+
+## EXAMPLES
+- Cancellation envelope:
+    { event_id, event_type: 'cancellation', airline_code: 'AI', pnr: '6X7Y8Z',
+      booking_date: '2026-05-09', cancel_reason_code: 'WX', fare_amount: 2845.0 }
+- Settlement record:
+    { settlement_id: 'BSP-2026-W19-AI234-001', bsp_cycle: '2026-W19',
+      airline_code: 'AI', pnr: '6X7Y8Z', fare_class: 'Y', od_pair: 'BOM-LHR',
+      ticket_number: '098-1234567890', issue_date: '2026-05-08T11:42:00+05:30',
+      fare_amount: 2845.00, currency: 'INR', commission_pct: 0.07,
+      refund_status: null, agency_iata: '14305820', source_system: 'BSP' }
+- Quarantine sidecar JSON:
+    { reason: '<schema_drift|partial|malformed|business_rule_failed>',
+      source_file: '<s3 key>', line_no: <int>,
+      correlation_id: '<lambda request id>',
+      validator_version: '<semver>',
+      original_record: { ... } }
+- Idempotency table: idempotency_keys_<learner> — single table, 4 guards:
+    PK 'row#<file_key>:<line_no>'              (TTL 30d) — row replay
+    PK 'file#<file_sha256>'                    (TTL 90d) — file-byte duplicate
+    PK 'canonical#<canonical_manifest_hash>'   (TTL 90d) — row-set logical duplicate
+    PK 'business#<settlement_id>'              (TTL 30d) — business-key duplicate
+- ASL state names (validator-pipeline.asl.json):
+    Chunk (Task) -> HasRows (Choice) -> Validate (Map) -> Land (Task)
+                                     -> NoRows (Pass, End)
+    Catch routes: QuarantineSchemaDrift, QuarantinePartial,
+                  QuarantineMalformed, NotifyOps
+- ASL state names (dlq-replayer.asl.json):
+    DrainDLQ (Task) -> Classify (Choice) -> NotifyOps (Task: sns:publish)
+                                         -> Done (Pass, End)
+- IAM ListBucket: Condition.s3:prefix pattern, NOT Resource suffix
+    (raw/ and raw/* both — literal "raw/" matches top-level ListBucket; "raw/*" matches sub-prefixes)
+- Reference artefacts in this project:
+    src/validator/handler.py     (Day 2 starter — direct S3 trigger; NOT the M5 chunk handler)
+    src/chunker/handler.py       (Day 5 Lab 1 — Stage 1 of validator-pipeline)
+    src/validator_m5/handler.py  (Day 5 Lab 1 — Stage 2 of validator-pipeline; chunk-aware)
+    src/lander/handler.py        (Day 5 Lab 1 — Stage 3 of validator-pipeline)
+    src/dlq_replayer/handler.py  (Day 5 Lab 3)
+    src/m5_test_validator/handler.py (Day 5 Lab 2 — SQS PARTIAL-BATCH only)
+    infra/validator-pipeline.asl.json (Day 5 Lab 1)
+    infra/dlq-replayer.asl.json (Day 5 Lab 3)
+    design/m4-batch-pipeline-design.md (Day 4 Lab 1)
+    design/m4-failure-modes.md (Day 4 Lab 2)
+
+## REVIEW
+- Every Cascade-generated artefact passes 5-dim HITL checklist before merge:
+    Correctness · Security · Observability · Scalability · Cost
+- HITL_REVIEW-<artefact>.md filled per output + committed; PASS at >=12/15 AND every dim >=2/3
+- ASL JSON is a reviewable artefact in v2. The 5-dim rubric applies:
+    Correctness:    every D4 failure mode has named state or Catch route
+    Security:       no wildcard ARNs; placeholders rendered via envsubst
+    Observability:  every Task has Retry (named errors) + Catch (ResultPath: $.error)
+                    + OutputPath: $.Payload
+    Scalability:    Choice gates short-circuit empty inputs; Map has MaxConcurrency
+    Cost:           no infinite Catch loops; no hardcoded Wait durations
+- Retry MUST use named errors (Lambda.TooManyRequestsException, States.Timeout).
+  NEVER "States.ALL" — too coarse; can mask ConfigError into infinite retries.
+- IAM: NEVER wildcards in Action or Resource; use named verbs + ARN-scoped resources
+- IAM: ListBucket scoped via Condition.s3:prefix (never via Resource suffix)
+- Logging: powertools Logger + correlation_id (extracted via correlation_id_path);
+  structured JSON only; NEVER print() in code paths
+- Errors: classified into PipelineError ladder (SchemaError, ReferenceError,
+  BusinessRuleError, TransientError, ConfigError, ManifestMismatchError);
+  NEVER bare 'except: pass'
+- Idempotency: 4 guards in one DynamoDB table with prefixed PKs (see EXAMPLES)
+- Region: every CLI example uses --region ap-south-1; every code path reads from env var
+- Synthetic data only: no real customer / production data anywhere in committed artefacts
+- batchItemFailures (SQS PARTIAL-BATCH) is ONLY for transient infra failures;
+  schema failures -> quarantine + ACK, NEVER add to batchItemFailures.
