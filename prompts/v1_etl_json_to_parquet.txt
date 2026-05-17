@@ -1,0 +1,88 @@
+# Day 6 Lab 2 — Cascade prompt template for the ETL Lambda
+# 5-section prompt: ROLE · REPO RULES · TASK · OUTPUT FORMAT · REVIEW
+
+[LAYER 1] ROLE
+You are an AWS-native Python engineer authoring a JSON → Parquet conversion
+Lambda. Output is partitioned, Snappy-compressed Parquet in the curated
+zone of the Glue Catalog.
+
+[LAYER 2] REPO RULES
+- Read .windsurfrules v3 at repo root before generating.
+- Use CATALOG CONTEXT — defines the two-table model, partition keys, Parquet+Snappy write contract.
+- File path:  src/etl_json_to_parquet/handler.py
+- Tests path: tests/test_etl_json_to_parquet.py
+- Layer: AWSSDKPandas-Python312 (trainer-provided ARN); provides pyarrow + pandas.
+- Defer all `import pyarrow` inside handler() so the module imports cleanly
+  in local dev environments without the layer installed.
+
+[LAYER 3] TASK
+Author src/etl_json_to_parquet/handler.py with the following contract:
+
+EVENT IN:
+    { "file_key":      "validated/<learner>/validated_settlement_json/source_system=BSP/ingest_date=2026-05-09/chunk-0001.jsonl",
+      "source_system": "BSP",
+      "ingest_date":   "2026-05-09",
+      "chunk_id":      "0001" }
+
+RETURN OUT:
+    { "status":          "converted" | "skipped" | "failed",
+      "rows_in":         <int>,
+      "rows_out":        <int>,
+      "parquet_key":     "curated/settlement/ingest_date=<date>/source_system=<src>/part-<chunk_id>.parquet",
+      "file_sha256_in":  "<64-hex>",
+      "file_sha256_out": "<64-hex> or null" }
+
+BEHAVIOUR:
+1. s3.get_object(BUCKET_NAME, file_key); read body bytes; compute sha256.
+2. Decode as UTF-8 JSONL; one row per line; skip blank lines; skip malformed
+   rows (Day 5 already quarantined them).
+3. normalise_inbound(row):
+     - if 'amount' present and 'fare_amount' absent → rename to fare_amount
+     - drop '_line_no' (Day-5 chunker internal field)
+4. Define FIXED schema (v3) — 13 fields:
+     settlement_id   STRING
+     airline_code    STRING
+     pnr             STRING
+     fare_class      STRING
+     od_pair         STRING
+     ticket_number   STRING
+     bsp_cycle       STRING
+     issue_date      TIMESTAMP_MILLIS
+     fare_amount     DECIMAL(12,2)
+     currency        STRING
+     commission_pct  DECIMAL(5,4)
+     refund_status   STRING
+     agency_iata     STRING
+5. pa.Table.from_pylist(records); table.cast(SCHEMA, safe=False).
+   On cast error → raise SchemaInferenceError.
+6. pq.write_table(table, buf, compression='snappy', write_statistics=True).
+7. s3.put_object to curated/settlement/ingest_date=<>/source_system=<>/part-<chunk_id>.parquet.
+
+ENV VARS REQUIRED:
+- BUCKET_NAME   (raise ConfigError if missing)
+- LEARNER       (raise ConfigError if missing)
+
+ERRORS RAISED:
+- SchemaInferenceError → ASL Catch routes to QuarantineSchemaDrift (when wired Day 11)
+- ConfigError          → ASL Catch routes to NotifyOps
+
+LOGGING:
+- JSON with corr_id.
+- Key events: etl_start, etl_empty, etl_done.
+
+[LAYER 4] OUTPUT FORMAT
+- handler(event, context) signature.
+- Type hints: Python 3.12 (`from __future__ import annotations`).
+- Imports at top of file: stdlib + boto3 only.
+- PyArrow imports DEFERRED into handler() body (lazy import — so module
+  parses without the layer locally).
+- Tests using moto for S3 + inline PyArrow assertions.
+
+[LAYER 5] REVIEW
+Self-grade on 6 dimensions (Schema Discipline is the 6th — new in v3):
+- Correctness: empty-input returns status='skipped'; cast failure raises SchemaInferenceError.
+- Security: BUCKET_NAME via env, never hardcoded.
+- Observability: every outcome has a distinct event name.
+- Scalability: one PyArrow Table fits in 1024 MB memory at 50K rows; document >50K as Glue Job territory.
+- Cost: Snappy compression default; one Parquet file per chunk; no extra S3 round-trips.
+- Schema Discipline (NEW): fixed PyArrow schema; cast failures fail loud; documented evolution path.

@@ -1,0 +1,170 @@
+# .windsurfrules — v3 (Day 6 Lab 1 target state)
+#
+# CATALOG CONTEXT block inserted between BATCH CONTEXT and EXAMPLES.
+# Day 7 adds STREAM CONTEXT → v4. Days 8-11 each add one more context layer.
+
+## REPO RULES
+- Lambdas: src/<component>/handler.py + tests/test_<component>.py
+- ASL state machines: infra/*.asl.json
+- Glue + Athena: scripts/provision_m6_glue.sh + sql/m6-*.sql
+- IaC: infra/template.yaml (AWS SAM)
+- Audit folders (committed): prompts/ reviews/ design/ sql/
+- Region locked: ap-south-1; CLI examples hardcode, code uses env var (AWS_REGION)
+- Branches: module-N-<learner>; MRs only — no direct commits to main
+
+## CONSTRAINTS
+- Bedrock: invoke via APAC inference PROFILE (not raw model ID):
+    apac.anthropic.claude-3-5-sonnet-20241022-v2:0
+- Bedrock budget: max 50 invocations + 20,000 tokens per learner per session.
+- Bedrock FORBIDDEN in this sandbox: Studio, Knowledge Bases, Agents, AgentCore.
+- Lambda: max 10 functions per learner across programme; max 2048 MB memory;
+  runtime python3.12; default timeout 60s (modules may override per-lab —
+  e.g. ETL Lambda on D6 uses 180s, SageMaker wrapper on D9 uses 30s).
+- SageMaker: max 1 endpoint; provisioned: allowed CPU instance families only;
+  D9 uses Serverless (MemorySizeInMB + MaxConcurrency); NO GPU instances.
+- Glue: max 3 jobs (type=glueetl); max 4 DPU per job; max 6 DPU-hours cumulative
+  across whole programme; sessions disabled. Crawlers DO NOT count against the
+  ≤3 jobs cap.
+- DynamoDB: PAY_PER_REQUEST billing for idempotency tables; no GSIs required.
+- Athena: workgroup `accelya_<learner>` enforces BytesScannedCutoffPerQuery
+  (100 MB default; Lab 3 drops to 10 MB temporarily). `EnforceWorkGroupConfiguration=true`.
+- FIS (Fault Injection): max 20 minutes action time per lab.
+- GitHub: public starter repo; MRs only; manual cleanup-sandbox after each module.
+- AWS Budgets: NOT supported in sandbox — use CW metric-math alarms.
+- Cost Explorer API: NOT enabled in sandbox — use CW metric proxies.
+- Step Functions: 256 KiB execution state limit. NEVER pass `rows[]` through state;
+  chunks live in S3 staging, only chunk_keys travel through ASL.
+
+## ASL CHUNK CONTEXT
+# (unchanged from v2 — see .windsurfrules-v2.template for full block)
+# Applies to: chunker, validator_m5, lander Lambdas.
+
+## SQS PARTIAL-BATCH CONTEXT
+# (unchanged from v2 — see .windsurfrules-v2.template for full block)
+# Applies to: m5_test_validator (Lab 2 standalone demo only).
+
+## CATALOG CONTEXT
+# Use this block when Cascade scaffolds reads/writes against Glue Catalog
+# or generates Athena SQL. Applies to: etl_json_to_parquet, all SQL files,
+# any future Day-7+ enricher that reads from curated/.
+
+- Two-table model (Lab 1 provisions both):
+    accelya_curated_<learner>.settlement
+        (Parquet — primary read target; Snappy compression)
+    accelya_validated_<learner>.validated_settlement_json
+        (JSON SerDe — kept for cost-comparison only; do NOT add new readers)
+
+- Format:
+    Parquet (Snappy)  — curated/ zone (write target for ETL Lambda)
+    JSON SerDe         — validated/ zone (read-only after Day 5 ASL pipeline)
+
+- Partition keys (BOTH tables, identical layout):
+    source_system  (STRING)  — values: BSP | ARC | ATPCO | GDS
+    ingest_date    (STRING — Crawler default; lab queries treat as STRING)
+    Hive-style paths in S3:
+        validated/<learner>/validated_settlement_json/
+            source_system=BSP/ingest_date=2026-05-09/<file>.jsonl
+        curated/settlement/
+            ingest_date=2026-05-09/source_system=BSP/part-00000.parquet
+
+- Schema version: v3 (current)
+    v1 (2026-04): {settlement_id, airline_code, fare_amount}
+    v2 (2026-05): + currency, commission_pct
+    v3 (2026-W19): + ticket_number, bsp_cycle
+- Known evolution:
+    'amount' inbound from some sources → mapped to fare_amount by ETL
+    agency_iata may be NULL for v1 rows
+
+- Read pattern (preferred):
+    SQL over the catalog table — NEVER read raw Parquet files directly
+    Partition pruning on `ingest_date + source_system` is MANDATORY
+    SELECT only the columns needed — NEVER `SELECT *` on Parquet
+    Always include WHERE on at least one partition column
+
+- Write pattern (curated zone):
+    Parquet (Snappy), partitioned by `ingest_date + source_system`
+    One file per partition per ETL run (atomic publish)
+    Use PyArrow + AWSSDKPandas layer in Lambda (≤50K rows/file)
+    Use Glue Job (2 DPU, 15 min) for larger files
+    NEVER write JSON to curated/
+
+- Forbidden patterns (HITL Schema Discipline scores 0):
+    SELECT * on a Parquet table
+    Query without a partition filter
+    JSON output to curated/<table>/
+    Crawler over raw/ or another learner's prefix
+    Glue Job > 4 DPU per job, or cumulative > 6 DPU-h
+
+- ETL Lambda contract:
+    function name: accelya-etl-json-to-parquet-<learner>
+    runtime: python3.12 (x86_64)
+    memory: 1024 MB; timeout: 180 s
+    layer: AWSSDKPandas-Python312 (trainer-provided; ARN via $PANDAS_LAYER_ARN env var)
+    event in: { file_key, source_system, ingest_date, chunk_id }
+    return:   { status, rows_in, rows_out, parquet_key, file_sha256_in, file_sha256_out }
+    schema:   fixed via pa.schema(...) — new columns silently dropped until schema updated
+
+## EXAMPLES
+- Cancellation envelope:
+    { event_id, event_type: 'cancellation', airline_code: 'AI', pnr: '6X7Y8Z',
+      booking_date: '2026-05-09', cancel_reason_code: 'WX', fare_amount: 2845.0 }
+- Settlement record:
+    { settlement_id: 'BSP-2026-W19-AI234-001', bsp_cycle: '2026-W19',
+      airline_code: 'AI', pnr: '6X7Y8Z', fare_class: 'Y', od_pair: 'BOM-LHR',
+      ticket_number: '098-1234567890', issue_date: '2026-05-08T11:42:00+05:30',
+      fare_amount: 2845.00, currency: 'INR', commission_pct: 0.07,
+      refund_status: null, agency_iata: '14305820', source_system: 'BSP' }
+- Quarantine sidecar JSON:
+    { reason: '<schema_drift|partial|malformed|business_rule_failed>',
+      source_file: '<s3 key>', line_no: <int>,
+      correlation_id: '<lambda request id>',
+      validator_version: '<semver>',
+      original_record: { ... } }
+- Idempotency table: idempotency_keys_<learner> — single table, 4 guards:
+    PK 'row#<file_key>:<line_no>'              (TTL 30d)
+    PK 'file#<file_sha256>'                    (TTL 90d)
+    PK 'canonical#<canonical_manifest_hash>'   (TTL 90d)
+    PK 'business#<settlement_id>'              (TTL 30d)
+- ASL state names (validator-pipeline.asl.json):
+    Chunk -> HasRows -> Validate (Map) -> Land
+                      -> NoRows
+    Catch: QuarantineSchemaDrift, QuarantinePartial, QuarantineMalformed, NotifyOps
+- ASL state names (dlq-replayer.asl.json):
+    DrainDLQ -> Classify -> NotifyOps (sns:publish) | Done
+- Athena reconciliation queries (sql/m6-reconciliation-5.sql):
+    Q1 settlement-by-airline, Q2 missing-tickets, Q3 refund-rate-by-OD,
+    Q4 top-OD-pairs-by-fare, Q5 fare-anomalies-vs-7d-median
+- IAM ListBucket: Condition.s3:prefix pattern, NOT Resource suffix
+- Reference artefacts in this project:
+    src/validator/handler.py (Day 2 starter)
+    src/chunker/handler.py + validator_m5/handler.py + lander/handler.py (Day 5)
+    src/dlq_replayer/handler.py + m5_test_validator/handler.py (Day 5)
+    src/etl_json_to_parquet/handler.py (Day 6 Lab 2)
+    infra/validator-pipeline.asl.json + dlq-replayer.asl.json (Day 5)
+    scripts/provision_m5_resources.sh + provision_m6_glue.sh
+    sql/m6-reconciliation-5.sql
+
+## REVIEW
+- Every Cascade-generated artefact passes 6-dim HITL checklist before merge:
+    Correctness · Security · Observability · Scalability · Cost · Schema Discipline
+- HITL_REVIEW-<artefact>.md filled per output + committed;
+  PASS at >=14/18 AND every dim >=2/3
+- Schema Discipline dim (NEW in v3) checks:
+    - Partition keys match query patterns
+    - Schema evolution path documented (additive / breaking / hard-breaking)
+    - Columnar projection enforced (no SELECT *)
+    - Parquet+Snappy on writes; no JSON in curated/
+    - Crawler scoped to learner prefix; never cohort-shared
+- ASL JSON is a reviewable artefact in v2+. The 5-dim rubric applies plus
+  Schema Discipline if the ASL touches catalog tables.
+- Retry MUST use named errors. NEVER `States.ALL`.
+- IAM: NEVER wildcards in Action or Resource; named verbs + ARN-scoped resources.
+- IAM: ListBucket scoped via Condition.s3:prefix.
+- Logging: structured JSON with corr_id; NEVER print().
+- Errors: classified into PipelineError ladder. Day 6 adds SchemaInferenceError
+  (raised when Crawler discovers conflicting types across files).
+- Idempotency: 4 guards in one DynamoDB table with prefixed PKs.
+- Region: every CLI example uses --region ap-south-1; every code path reads from env var.
+- Synthetic data only.
+- batchItemFailures: ONLY for transient infra failures.
+- Athena: ALL queries via the `accelya_<learner>` workgroup; bytes cap enforced.

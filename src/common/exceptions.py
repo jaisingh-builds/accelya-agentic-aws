@@ -47,6 +47,7 @@ __all__ = [
     "MissingEnvVarError",
     "MalformedRowError",
     "ManifestMismatchError",
+    "SchemaInferenceError",
 ]
 
 
@@ -152,3 +153,18 @@ class ManifestMismatchError(PipelineError):
     to the chunker's reported `row_count`. ASL Catch routes to QuarantinePartial.
     """
     quarantine_reason = "partial"
+
+
+# ── Schema inference conflict (Day 6 — ETL Lambda / Crawler) ──────────────
+class SchemaInferenceError(PipelineError):
+    """Crawler or ETL discovers conflicting types across files.
+
+    Examples:
+      - File A has `fare_amount` as DOUBLE; File B has it as STRING.
+      - Crawler infers different partition column types across runs.
+      - ETL receives an input row with a type that PyArrow `table.cast(SCHEMA)`
+        cannot coerce (e.g. non-numeric in DECIMAL column).
+
+    ASL Catch (when wired in Day 11) routes to QuarantineSchemaDrift.
+    """
+    quarantine_reason = "schema_drift"
