@@ -163,12 +163,14 @@ JSON_CRAWLER_CONFIG=$(cat <<EOF
 EOF
 )
 
+TMP_JSON_CFG="/tmp/m6-crawler-json-cfg.json"
+printf '%s\n' "$JSON_CRAWLER_CONFIG" > "$TMP_JSON_CFG"
 if aws glue get-crawler --name "$CRAWLER_JSON" --region "$REGION" >/dev/null 2>&1; then
   echo "  ✓ Crawler $CRAWLER_JSON exists; updating..."
-  echo "$JSON_CRAWLER_CONFIG" | aws glue update-crawler --cli-input-json file:///dev/stdin --region "$REGION" 2>&1 \
+  aws glue update-crawler --cli-input-json "file://$TMP_JSON_CFG" --region "$REGION" 2>&1 \
     || echo "    (update may be a no-op if config unchanged)"
 else
-  echo "$JSON_CRAWLER_CONFIG" | aws glue create-crawler --cli-input-json file:///dev/stdin --region "$REGION"
+  aws glue create-crawler --cli-input-json "file://$TMP_JSON_CFG" --region "$REGION"
   echo "  ✓ Crawler $CRAWLER_JSON created"
 fi
 
@@ -201,12 +203,14 @@ PARQ_CRAWLER_CONFIG=$(cat <<EOF
 EOF
 )
 
+TMP_PARQ_CFG="/tmp/m6-crawler-parq-cfg.json"
+printf '%s\n' "$PARQ_CRAWLER_CONFIG" > "$TMP_PARQ_CFG"
 if aws glue get-crawler --name "$CRAWLER_PARQ" --region "$REGION" >/dev/null 2>&1; then
   echo "  ✓ Crawler $CRAWLER_PARQ exists; updating..."
-  echo "$PARQ_CRAWLER_CONFIG" | aws glue update-crawler --cli-input-json file:///dev/stdin --region "$REGION" 2>&1 \
+  aws glue update-crawler --cli-input-json "file://$TMP_PARQ_CFG" --region "$REGION" 2>&1 \
     || echo "    (update may be a no-op if config unchanged)"
 else
-  echo "$PARQ_CRAWLER_CONFIG" | aws glue create-crawler --cli-input-json file:///dev/stdin --region "$REGION"
+  aws glue create-crawler --cli-input-json "file://$TMP_PARQ_CFG" --region "$REGION"
   echo "  ✓ Crawler $CRAWLER_PARQ created"
 fi
 

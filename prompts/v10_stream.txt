@@ -1,0 +1,102 @@
+# Day 7 — 10-layer prompt template for streaming design + scaffolding
+#
+# Layer slots: ROLE · REPO RULES · CONSTRAINTS · ASL CHUNK CONTEXT ·
+#              SQS PARTIAL-BATCH CONTEXT · STREAM CONTEXT · CATALOG CONTEXT ·
+#              EXAMPLES · TASK · OUTPUT FORMAT · REVIEW
+#
+# This is the FIRST prompt template with all 10 context layers populated.
+# Cascade reads .windsurfrules v4 implicitly; this prompt focuses on the
+# TASK + OUTPUT FORMAT layers for streaming-specific generation.
+
+[LAYER 1] ROLE
+You are an AWS-native streaming architect authoring producer / consumer
+contracts + reference Kinesis CLI provisioning. You write production-quality
+JSON contracts and bash scripts consistent with the programme's PipelineError
+ladder and idempotency contracts.
+
+[LAYER 2] REPO RULES
+- Read .windsurfrules v4 at repo root before generating.
+- All commands target ap-south-1.
+- Producer Lambda spec lands in design/m7-producer-contract.md (PAPER ONLY today).
+- Provisioning script lands in scripts/provision_m7_stream.sh.
+
+[LAYER 3] CONSTRAINTS
+- Sandbox caps per .windsurfrules CONSTRAINTS section.
+- Kinesis: 2 shards (sandbox-recommended); 24h retention.
+- Day 7 is DESIGN-ONLY — zero Lambda deploys today.
+
+[LAYER 4-7] (contexts from .windsurfrules v4 inherited; do not duplicate)
+
+[LAYER 8] EXAMPLES
+- Stream name: accelya-bookings-stream-<learner>
+- PK strategy (default for design today): f"{airline_code}:{booking_date.isoformat()}"
+- Idempotency-store table: stream_seen_keys_<learner> (see CATALOG/STREAM CONTEXT)
+- 5 event types: cancellation, refund, no_show, upgrade, seat_release
+
+[LAYER 9] TASK
+Author design/m7-producer-contract.md with 6 sections:
+
+(1) INPUT SHAPE
+    Producer event in: { "events": [<envelope>, ...] }
+    Envelope fields:
+      event_id, event_type, event_time, ingest_time,
+      airline_code, booking_date, pnr, source_system, payload
+    Per-type payloads documented (cancellation, refund, no_show, upgrade, seat_release).
+
+(2) OUTPUT SHAPE
+    Producer return:
+      { submitted_count: <int>,
+        failed_count:    <int>,
+        failed_records:  [{ event_id, error_code, error_message }] }
+
+(3) SIDE EFFECTS
+    For each batch of ≤500 events:
+      - Call kinesis.put_records(StreamName=..., Records=[...])
+      - PartitionKey: f"{airline_code}:{booking_date.isoformat()}"
+      - Data: base64-encoded JSON envelope
+      - EMF metrics emitted per batch: records_in, records_failed, retry_count
+        Dimensions: stream_name, airline_code
+    No persistence — producer is THIN.
+
+(4) RETRY POLICY
+    On ProvisionedThroughputExceededException:
+      - Compute failed records subset from response.Records[]
+      - Backoff: 2^attempt * jitter (0.5-1.5x)
+      - Re-submit failed records only
+      - Cap at 5 retries; on retry-exhaustion, escalate to SNS
+        accelya-pipeline-escalations-<learner>
+
+(5) METRICS
+    EMF metrics (one log line per batch):
+      records_in    Count   total events received
+      records_failed Count  events that PutRecords reported failed
+      retry_count   Count   number of retry iterations
+    Dimensions: stream_name, airline_code
+    Log level: INFO on success; WARN on retry; ERROR on retry-exhaustion.
+
+(6) FAILURE HANDLING
+    Pre-submit:
+      - Schema-validate envelope (event_id, event_type, airline_code, pnr non-empty)
+      - On fail: raise ValidationError(event_id=...); do NOT submit.
+      - ValidationErrors get returned in failed_records[] with error_code=validation.
+    Post-submit:
+      - Per-record errors from PutRecords are translated to failed_records[] entries.
+      - Caller (orchestrator) decides whether to re-queue or escalate.
+
+[LAYER 10] OUTPUT FORMAT
+- Markdown file at design/m7-producer-contract.md
+- 6 numbered sections, each ≤200 words
+- One ASCII flow diagram showing: events → validate → PutRecords → response → EMF
+- A code snippet in Section 3 showing the deterministic PK formula
+- No actual Lambda handler code — design only
+
+[LAYER 11] REVIEW
+After Cascade generation, self-grade on 6 dimensions:
+- Correctness:    Producer handles all 5 event types; envelope fields complete.
+- Safety:         Validation pre-submit; no PII leakage in error_message.
+- Idempotency:    Producer is stateless (consumer owns idempotency); no double-PutRecords.
+- Observability:  EMF metrics named + tagged; corr_id in every log line.
+- Cost:           PutRecords bulk path (NOT PutRecord in a loop).
+- Per-PK Order:   PK formula deterministic; same input → same shard guaranteed;
+                  cancel→refund pairs on same PNR land on same shard.
+Pass threshold: ≥14/18 AND every dim ≥2/3.

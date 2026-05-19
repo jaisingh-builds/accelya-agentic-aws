@@ -68,31 +68,52 @@ aws glue get-crawlers --region $AWS_REGION \
 
 Expected: 4 databases, 2 Crawlers in `READY` state.
 
-### Step 3 — Re-stage Day 5 output into Hive-style paths
+### Step 3 — Upload the Day 6 synthetic dataset into Hive-style paths
 
-Day 5's validator wrote `validated/<learner>/<bsp_cycle>/<chunk>.jsonl`. For the JSON Crawler to discover `source_system` and `ingest_date` as partition keys, we need Hive paths like `validated/<learner>/validated_settlement_json/source_system=BSP/ingest_date=2026-05-09/`.
+Day 5's validator wrote `validated/<learner>/<bsp_cycle>/<chunk>.jsonl` — that's grouped by `bsp_cycle`, not by Hive partition keys, and there are only ~100 rows. For Lab 1 + Lab 2 we need a richer dataset organised under Hive paths: `validated/<learner>/validated_settlement_json/source_system=BSP/ingest_date=2026-05-09/`.
+
+A 48,000-row synthetic dataset is committed in the repo at `data/m6-settlements/` (16 partitions × 3K rows, ~15 MB). One script copies it into your S3 prefix:
 
 ```bash
-# List what Day 5 produced (group by bsp_cycle)
-aws s3 ls s3://$BUCKET/validated/$LEARNER/ --recursive --region $AWS_REGION | head -5
+# Make sure you've pulled latest
+git pull
 
-# Copy/re-stage. Adjust SOURCE + DATE as needed for your data.
-SOURCE=BSP
-DATE=2026-05-09
-
-# For each Day-5 chunk file, copy into the Hive path
-for KEY in $(aws s3 ls s3://$BUCKET/validated/$LEARNER/2026-W19/ --region $AWS_REGION \
-              | awk '{print $4}' | grep -v '_manifests'); do
-  aws s3 cp \
-    s3://$BUCKET/validated/$LEARNER/2026-W19/$KEY \
-    s3://$BUCKET/validated/$LEARNER/validated_settlement_json/source_system=$SOURCE/ingest_date=$DATE/$KEY \
-    --region $AWS_REGION
-done
-
-# Verify the new paths
-aws s3 ls s3://$BUCKET/validated/$LEARNER/validated_settlement_json/source_system=$SOURCE/ingest_date=$DATE/ \
-  --region $AWS_REGION
+# Upload all 16 partitions to your validated/ zone (≈30 s)
+bash scripts/upload_m6_settlements.sh $LEARNER
 ```
+
+Expected output: 16 partition paths listed, ending with the layout summary:
+
+```
+source_system=ARC/ingest_date=2026-05-09
+source_system=ARC/ingest_date=2026-05-10
+source_system=ARC/ingest_date=2026-05-11
+source_system=ARC/ingest_date=2026-05-12
+source_system=ATPCO/ingest_date=2026-05-09
+... (16 entries)
+```
+
+Verify a sample:
+
+```bash
+aws s3 ls s3://$BUCKET/validated/$LEARNER/validated_settlement_json/source_system=BSP/ingest_date=2026-05-09/ \
+  --region $AWS_REGION
+# Expected: 1 file (part-00000.jsonl, ~950 KB, 3000 rows)
+```
+
+> **About the data:** 4 source_systems (BSP, ARC, ATPCO, GDS) × 4 ingest_dates (2026-05-09 through 2026-05-12) × 3,000 rows = 48,000 rows total. Schema matches Day 6 v3 catalog (13 columns). See `data/m6-settlements/README.md` for full details — realism notes, regeneration instructions, and how this dataset interacts with Athena's 10 MB billing minimum.
+>
+> **If you want to also include your Day-5 output** (e.g. to keep historical lineage), copy it after the upload:
+> ```bash
+> for KEY in $(aws s3 ls s3://$BUCKET/validated/$LEARNER/2026-W19/ --region $AWS_REGION \
+>               | awk '{print $4}' | grep -v '_manifests'); do
+>   aws s3 cp \
+>     s3://$BUCKET/validated/$LEARNER/2026-W19/$KEY \
+>     s3://$BUCKET/validated/$LEARNER/validated_settlement_json/source_system=BSP/ingest_date=2026-05-08/$KEY \
+>     --region $AWS_REGION
+> done
+> ```
+> (Day-5 data lands at `ingest_date=2026-05-08` — one day earlier than the Day-6 dataset starts, so partitions don't collide.)
 
 ### Step 4 — Run JSON Crawler (first run)
 
@@ -118,23 +139,33 @@ aws glue get-partitions --database-name accelya_validated_$LEARNER \
   --query 'Partitions[].Values' --output table
 ```
 
-Expected: table `validated_settlement_json` with 14 columns + 2 partition keys (`source_system`, `ingest_date`); 1 partition (`[BSP, 2026-05-09]`).
-
-### Step 5 — Drop a NEW partition + rerun JSON Crawler
-
-Drop one of your Day-5 chunk files into a *new* partition (different date), then rerun.
+Expected: table `validated_settlement_json` with 14 columns + 2 partition keys (`source_system`, `ingest_date`); 16 partitions (4 source_systems × 4 ingest_dates) — verify:
 
 ```bash
-NEW_DATE=2026-05-10
-SOURCE_FILE=$(aws s3 ls s3://$BUCKET/validated/$LEARNER/validated_settlement_json/source_system=$SOURCE/ingest_date=$DATE/ \
-                --region $AWS_REGION | awk '{print $4}' | head -1)
+aws glue get-partitions --database-name accelya_validated_$LEARNER \
+  --table-name validated_settlement_json --region $AWS_REGION \
+  --query 'Partitions[].Values' --output table
+# Expected: 16 rows total
+```
+
+### Step 5 — Demonstrate additive-partition evolution
+
+The 2nd Crawler run is the **additive evolution** proof: drop a new chunk into a partition that didn't exist before, rerun the Crawler, observe that the schema doesn't change — only the partition count grows.
+
+Pick a fresh `ingest_date` (one day past the dataset, so we know it's new):
+
+```bash
+NEW_DATE=2026-05-13
+SOURCE=BSP
+
+# Copy one of the existing partition files to a new partition path
 aws s3 cp \
-  s3://$BUCKET/validated/$LEARNER/validated_settlement_json/source_system=$SOURCE/ingest_date=$DATE/$SOURCE_FILE \
-  s3://$BUCKET/validated/$LEARNER/validated_settlement_json/source_system=$SOURCE/ingest_date=$NEW_DATE/$SOURCE_FILE \
+  s3://$BUCKET/validated/$LEARNER/validated_settlement_json/source_system=$SOURCE/ingest_date=2026-05-09/part-00000.jsonl \
+  s3://$BUCKET/validated/$LEARNER/validated_settlement_json/source_system=$SOURCE/ingest_date=$NEW_DATE/part-00000.jsonl \
   --region $AWS_REGION
 
+# Re-run the Crawler
 aws glue start-crawler --name validated-json-crawler-$LEARNER --region $AWS_REGION
-# Wait for READY again
 while true; do
   STATE=$(aws glue get-crawler --name validated-json-crawler-$LEARNER --region $AWS_REGION \
     --query 'Crawler.State' --output text)
@@ -142,13 +173,17 @@ while true; do
   sleep 15
 done
 
-# Should now show TWO partitions
+# Verify: 17 partitions now (16 original + 1 new), still 14 columns
 aws glue get-partitions --database-name accelya_validated_$LEARNER \
   --table-name validated_settlement_json --region $AWS_REGION \
-  --query 'Partitions[].Values' --output table
-```
+  --query 'length(Partitions)' --output text
+# Expected: 17
 
-Expected: 2 partitions, no schema change.
+aws glue get-table --database-name accelya_validated_$LEARNER \
+  --name validated_settlement_json --region $AWS_REGION \
+  --query 'length(Table.StorageDescriptor.Columns)' --output text
+# Expected: 14 (unchanged from first run — additive evolution proven)
+```
 
 ### Step 6 — Document evidence + commit
 

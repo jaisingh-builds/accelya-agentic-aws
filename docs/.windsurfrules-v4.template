@@ -1,0 +1,195 @@
+# .windsurfrules — v4 (Day 7 Lab 1 target state)
+#
+# STREAM CONTEXT block inserted between BATCH CONTEXT and CATALOG CONTEXT.
+# Day 8 adds STATE CONTEXT → v5. Days 9-11 each add one more context layer.
+
+## REPO RULES
+- Lambdas: src/<component>/handler.py + tests/test_<component>.py
+- ASL state machines: infra/*.asl.json
+- Glue + Athena: scripts/provision_m6_glue.sh + sql/m6-*.sql
+- Kinesis + DDB streaming: scripts/provision_m7_stream.sh + design/m7-*.md
+- IaC: infra/template.yaml (AWS SAM)
+- Audit folders (committed): prompts/ reviews/ design/ sql/
+- Region locked: ap-south-1; CLI examples hardcode, code uses env var (AWS_REGION)
+- Branches: module-N-<learner>; MRs only — no direct commits to main
+
+## CONSTRAINTS
+- Bedrock: invoke via APAC inference PROFILE:
+    apac.anthropic.claude-3-5-sonnet-20241022-v2:0
+- Bedrock budget: max 50 invocations + 20,000 tokens per learner per session.
+- Bedrock FORBIDDEN in this sandbox: Studio, Knowledge Bases, Agents, AgentCore.
+- Lambda: max 10 functions per learner; max 2048 MB memory; runtime python3.12.
+- SageMaker: max 1 endpoint; serverless only on D9; NO GPU instances.
+- Glue: max 3 jobs (type=glueetl); max 4 DPU per job; max 6 DPU-h cumulative.
+- DynamoDB: PAY_PER_REQUEST billing; no GSIs required.
+- Kinesis: 2 shards per stream (sandbox lab default); no enhanced-fan-out.
+- Athena: workgroup `accelya_<learner>` enforces BytesScannedCutoffPerQuery (100 MB).
+- FIS (Fault Injection): max 20 minutes action time per lab.
+- GitHub: public starter repo; MRs only; manual cleanup-sandbox after each module.
+- AWS Budgets: NOT supported in sandbox — use CW metric-math alarms.
+- Cost Explorer API: NOT enabled in sandbox — use CW metric proxies.
+- Step Functions: 256 KiB execution state limit. NEVER pass rows[] through state.
+
+## ASL CHUNK CONTEXT
+# (unchanged from v2 — see .windsurfrules-v2.template for full block)
+
+## SQS PARTIAL-BATCH CONTEXT
+# (unchanged from v2 — Lab-2-only on D5)
+
+## STREAM CONTEXT
+# Use this block when Cascade scaffolds Kinesis producers, ESM consumers,
+# or any code touching the bookings stream. Applies from Day 8 forward.
+
+- Stream name:    accelya-bookings-stream-<learner>
+- Shard count:    2 (sandbox lab default; production likely 4-8)
+- Region:         ap-south-1
+- Retention:      24 hours (default; production 72h-7d for replay)
+
+- PK strategy (TWO TIERS):
+    Bulk path (high-volume, order-tolerant):
+        f"{airline_code}:{booking_date.isoformat()}:{bucket_hash(pnr) % 8}"
+    Strict per-PNR chains (cancel→refund):
+        f"{airline_code}:{booking_date.isoformat()}:{pnr_hash}"
+        — combine with SequenceNumberForOrdering on PutRecord
+
+- ESM config (lab-safe explicit defaults — set EVERY ONE explicitly,
+  never rely on AWS defaults for streaming consumers):
+    FunctionResponseTypes:           [ReportBatchItemFailures]
+    ParallelizationFactor:           1
+    MaximumRetryAttempts:            3                  (NOT -1)
+    MaximumRecordAgeInSeconds:       3600   # 1 hour    (NOT -1)
+    BisectBatchOnFunctionError:      true
+    StartingPosition:                TRIM_HORIZON
+    BatchSize:                       100
+    MaximumBatchingWindowInSeconds:  5
+
+- Idempotency-store:
+    Table: stream_seen_keys_<learner>
+    PK:    f"stream#{stream_name}#{shard_id}#{sequence_number}"
+    TTL:   7 days (for cancellation events; 30 d for settlements, 24 h for security)
+    Write: PutItem with ConditionExpression='attribute_not_exists(pk)'
+           ConditionalCheckFailedException → silent skip (duplicate)
+
+- Iterator default: TRIM_HORIZON for first read; ESM persists last-processed
+  sequence number per shard automatically.
+
+- Producer rules — TWO PATHS:
+    (A) Bulk PutRecords ≤500 records; ~5 MB per call
+    (B) Strict-order sequential PutRecord with SequenceNumberForOrdering=<prev>
+    Always:
+      - Deterministic PK from (airline_code, booking_date[, pnr_hash])
+      - Retry ProvisionedThroughputExceededException with backoff + jitter, ≤5 retries
+      - Per-record failures from PutRecords: re-submit JUST the failed records
+      - EMF metrics: records_in, records_failed, retry_count
+        (tags: stream_name, airline_code)
+    Forbidden:
+      - Random PK (booking_id UUID)
+      - Static PK (any constant string)
+      - PutRecord in a loop (use PutRecords)
+
+- Consumer rules:
+    ESM-driven Lambda with FunctionResponseTypes=[ReportBatchItemFailures]
+    Per-record flow:
+      1. Compute idempotency key from event_id (shard_id + sequence_number)
+      2. ConditionalPut on stream_seen_keys_<learner>
+         CCFE → silent skip (duplicate)
+      3. Schema-validate envelope; on fail → quarantine + add to batchItemFailures? NO.
+         Quarantine + ACK (not failure). Quarantine = persisted decision.
+      4. Route by event_type → handler
+      5. Persist via Day-8 SFN state machine (start-execution + ACK)
+    Return shape:
+      { "batchItemFailures": [{"itemIdentifier": "<sequenceNumber>"}] }
+    Report ONLY the oldest failure per shard — ESM checkpoints at lowest failed seq#.
+    Records AFTER the failed one will be re-delivered → idempotency catches them.
+    NEVER raise from the handler — that fails the WHOLE batch.
+
+- Custom exception ladder applies (Day 4 PipelineError tree):
+    PipelineError (base)
+    ValidationError       → quarantine/<learner>/stream_invalid/<reason>/
+    MalformedRowError     → quarantine/<learner>/stream_malformed/
+    TransientError        → batchItemFailures (retry)
+    ConfigError           → SNS escalate (no auto-retry)
+
+- Observability:
+    Alarm: IteratorAge > 60s (Day 10 wires)
+    EMF dim names: stream_name, airline_code, event_type
+    Powertools Logger structured JSON; corr_id from context
+
+- Forbidden:
+    - Random PK; static PK
+    - PutRecord in a loop
+    - Resharding inside a Lambda (split/merge are ops actions, 5-10 min each)
+    - Returning messageId in batchItemFailures (it's sequence_number)
+    - Raising exceptions from consumer handlers (use batchItemFailures)
+
+## CATALOG CONTEXT
+# (unchanged from v3 — see .windsurfrules-v3.template for full block)
+
+## EXAMPLES
+- Cancellation envelope:
+    { event_id, event_type: 'cancellation', event_time, ingest_time,
+      airline_code: 'AI', booking_date: '2026-05-09', pnr: '6X7Y8Z',
+      source_system: 'GDS',
+      payload: { pnr, cancel_reason_code: 'WX', cancellation_event_id } }
+- Refund envelope:
+    { event_id, event_type: 'refund', event_time, ingest_time,
+      airline_code: 'AI', booking_date: '2026-05-09', pnr: '6X7Y8Z',
+      source_system: 'GDS',
+      payload: { pnr, original_cancel_event_id, refund_amount: 2845.0,
+                 currency: 'INR' } }
+- Stream idempotency table: stream_seen_keys_<learner>
+    PK 'stream#accelya-bookings-stream-<learner>#shardId-000000000000#<seq>'
+    TTL 7 days
+- Producer EMF metrics (one log line — CloudWatch extracts metrics server-side):
+    {"_aws":{"Timestamp":..., "CloudWatchMetrics":[{
+       "Namespace":"Accelya/Streaming",
+       "Dimensions":[["stream_name","airline_code"]],
+       "Metrics":[{"Name":"records_in","Unit":"Count"},
+                  {"Name":"records_failed","Unit":"Count"},
+                  {"Name":"retry_count","Unit":"Count"}]}]},
+     "stream_name":"accelya-bookings-stream-<learner>",
+     "airline_code":"AI",
+     "records_in":500, "records_failed":0, "retry_count":1}
+- Reference artefacts in this project:
+    src/validator/handler.py (Day 2 starter)
+    src/chunker/handler.py + validator_m5/handler.py + lander/handler.py (Day 5)
+    src/dlq_replayer/handler.py + m5_test_validator/handler.py (Day 5)
+    src/etl_json_to_parquet/handler.py (Day 6)
+    design/m7-producer-contract.example.md (Day 7 Lab 2 reference)
+    scripts/provision_m5_resources.sh + provision_m6_glue.sh + provision_m7_stream.sh
+    sql/m6-reconciliation-5.sql
+    data/m6-settlements/  (48K synthetic settlement rows)
+    data/m7-events/  (Day 8+: synthetic cancellation events)
+
+## REVIEW
+- Every Cascade-generated artefact passes 6-dim HITL checklist (Day 6 baseline):
+    Correctness · Security · Observability · Scalability · Cost · Schema Discipline
+- Day 7 LAB-LOCAL extension for stream design reviews (Lab 2):
+    Add a 6th dim "Per-PK Order" — checks: does PK strategy preserve
+    per-PK ordering for related events (cancel→refund chains)?
+    Random PK = 0. Pure airline+date = 2. Composite with hash bucket = 3.
+- HITL_REVIEW-<artefact>.md filled per output + committed; PASS at >=14/18 AND every dim >=2/3
+- Schema Discipline checks (carry-over from v3):
+    - Partition keys match query patterns (batch)
+    - Schema evolution path documented (additive / breaking / hard-breaking)
+    - Columnar projection enforced (no SELECT *)
+    - Parquet+Snappy on writes; no JSON in curated/
+- Per-PK Order checks (NEW lab-local in v4):
+    - Deterministic PK (no UUIDs, no `uuid4()` calls)
+    - Same input → same shard guaranteed
+    - cancel→refund chain on same PNR lands in order
+    - SequenceNumberForOrdering used for strict-order paths
+- Retry MUST use named errors. NEVER States.ALL.
+- IAM: NEVER wildcards in Action or Resource; named verbs + ARN-scoped resources.
+- Logging: structured JSON with corr_id; NEVER print().
+- Errors: PipelineError ladder (incl. SchemaInferenceError from Day 6,
+  TransientError for stream retries).
+- Idempotency:
+    Batch:  4 guards in one DDB table (row#/file#/canonical#/business#)
+    Stream: stream#<name>#<shard>#<seq> in stream_seen_keys table
+- Region: every CLI example uses --region ap-south-1.
+- Synthetic data only.
+- batchItemFailures (SQS PARTIAL-BATCH): transient infra only.
+- batchItemFailures (KINESIS STREAM): transient infra OR explicit retry-target only;
+    schema/validation failures → quarantine + ACK, NEVER add to batchItemFailures.
+- Athena: ALL queries via the `accelya_<learner>` workgroup; bytes cap enforced.
