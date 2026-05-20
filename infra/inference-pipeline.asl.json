@@ -1,0 +1,73 @@
+{
+  "Comment": "Day 8 Lab 1 — Bedrock enrich + persist for streaming events. BedrockEnrich Task with Retry on BedrockThrottleError and Catch on States.ALL → Quarantine.",
+  "StartAt": "BedrockEnrich",
+  "TimeoutSeconds": 300,
+  "States": {
+    "BedrockEnrich": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:accelya-bedrock-enrich-${LEARNER}",
+        "Payload.$": "$"
+      },
+      "OutputPath": "$.Payload",
+      "Retry": [
+        {
+          "ErrorEquals": ["BedrockThrottleError"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        },
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "Quarantine"
+        }
+      ],
+      "Next": "Persist"
+    },
+
+    "Persist": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:accelya-persist-enriched-${LEARNER}",
+        "Payload.$": "$"
+      },
+      "OutputPath": "$.Payload",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "End": true
+    },
+
+    "Quarantine": {
+      "Type": "Pass",
+      "Result": { "outcome": "quarantined", "reason": "bedrock_or_persist_failure" },
+      "End": true
+    }
+  }
+}

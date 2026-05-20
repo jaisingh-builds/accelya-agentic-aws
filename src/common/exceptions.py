@@ -48,6 +48,7 @@ __all__ = [
     "MalformedRowError",
     "ManifestMismatchError",
     "SchemaInferenceError",
+    "BedrockThrottleError",
 ]
 
 
@@ -153,6 +154,17 @@ class ManifestMismatchError(PipelineError):
     to the chunker's reported `row_count`. ASL Catch routes to QuarantinePartial.
     """
     quarantine_reason = "partial"
+
+
+# ── Bedrock throttle (Day 8 — bedrock-enrich Lambda) ──────────────────────
+class BedrockThrottleError(PipelineError):
+    """Bedrock returned 429 / ServiceUnavailable. Transient.
+
+    Caught in bedrock-enrich Lambda; raised so the state machine's Retry
+    policy retries with backoff (BedrockThrottleError → 2s × 3, BackoffRate 2.0).
+    Also signals dynamic sample_rate reduction (Day 10 wires).
+    """
+    quarantine_reason = "bedrock_throttle"
 
 
 # ── Schema inference conflict (Day 6 — ETL Lambda / Crawler) ──────────────

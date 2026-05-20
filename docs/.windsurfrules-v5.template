@@ -1,0 +1,194 @@
+# .windsurfrules — v5 (Day 8 Lab 1 target state)
+#
+# STATE CONTEXT block inserted between STREAM CONTEXT and CATALOG CONTEXT.
+# Day 9 adds MODEL CONTEXT → v6. Days 10-11 each add one more context layer.
+
+## REPO RULES
+- Lambdas: src/<component>/handler.py + tests/test_<component>.py
+- ASL state machines: infra/*.asl.json
+- Glue + Athena: scripts/provision_m6_glue.sh + sql/m6-*.sql
+- Kinesis + DDB streaming: scripts/provision_m7_stream.sh + design/m7-*.md
+- Streaming Lambdas + ASL (D8): scripts/deploy_m8_lambdas.sh + infra/inference-pipeline.asl.json
+- IaC: infra/template.yaml (AWS SAM)
+- Audit folders (committed): prompts/ reviews/ design/ sql/
+- Region locked: ap-south-1
+- Branches: module-N-<learner>; MRs only.
+
+## CONSTRAINTS
+- Bedrock: invoke via APAC inference PROFILE:
+    apac.anthropic.claude-3-5-sonnet-20241022-v2:0
+- Bedrock budget: max 50 invocations + 20,000 tokens per learner per session.
+- Bedrock HARD COST GUARD (env vars on bedrock-enrich Lambda):
+    BEDROCK_MAX_INVOCATIONS = 38
+    BEDROCK_MAX_TOKENS      = 18000
+- Bedrock FORBIDDEN: Studio, Knowledge Bases, Agents, AgentCore.
+- Lambda: max 10 functions per learner; max 2048 MB memory; runtime python3.12.
+- SageMaker: max 1 endpoint; serverless only on D9; NO GPU.
+- Glue: max 3 jobs (type=glueetl); max 4 DPU per job; max 6 DPU-h cumulative.
+- DynamoDB: PAY_PER_REQUEST billing.
+- Kinesis: 2 shards per stream (sandbox default).
+- Step Functions: 256 KiB execution state limit. NEVER pass rows[] through state.
+- Athena: workgroup `accelya_<learner>` enforces BytesScannedCutoffPerQuery (100 MB).
+- GitHub: public starter repo; MRs only.
+
+## ASL CHUNK CONTEXT
+# (unchanged from v2)
+
+## SQS PARTIAL-BATCH CONTEXT
+# (unchanged from v2)
+
+## STREAM CONTEXT
+# (unchanged from v4 — see .windsurfrules-v4.template for full block)
+
+## STATE CONTEXT
+# Use this block when Cascade scaffolds the THIN Kinesis consumer, the
+# state machine `inference-pipeline-<learner>`, or any per-record state
+# logic. Applies from Day 8 forward.
+
+- Triggered by: ESM on accelya-bookings-stream-<learner>
+
+- Idempotency model — TWO GUARDS + STATUS LIFECYCLE:
+    Guard A (Kinesis re-delivery):
+      pk = f"stream#{STREAM}#{shard_id}#{sequence_number}"
+    Guard B (producer-side dup):
+      pk = f"business#{event_type}#{booking_id}#{event_version}"
+    Status lifecycle:
+      CLAIMED → IN_PROGRESS (fresh; stale @ 300 s → reclaim) → COMPLETED
+    CRITICAL: only mark COMPLETED AFTER all side-effects succeed.
+
+- Idempotency table: stream_seen_keys_<learner>  (TTL 7 d)
+
+- Per-record state available to handler:
+    shard_id, sequence_number, partition_key, arrival_time, data
+
+- Partial-batch retry rules:
+    - Claim idempotency key BEFORE any side-effect
+    - Quarantine on ValidationError (NOT in batchItemFailures)
+    - On unhandled exception: append seq# to failures
+    - Return only OLDEST failure per shard:
+        return { "batchItemFailures": [{"itemIdentifier": <oldest_seq>}] }
+
+- THIN consumer (4 stages, in order):
+    1. Idempotency-claim (ConditionalPut on stream_seen_keys, status=CLAIMED)
+    2. base64 decode + envelope validate (raise ValidationError on fail)
+    3. sfn.start_execution(stateMachineArn=SM_ARN,
+                            name=f"enrich-{event_id}",  # DETERMINISTIC
+                            input={...envelope, stream_pk, corr_id})
+       Catch ExecutionAlreadyExists → idempotent skip (success)
+    4. Mark stream-PK status=COMPLETED
+    NEVER call Bedrock inline. NEVER write to S3 inline.
+
+- Sampling cadence + HARD COST GUARD (in bedrock-enrich, NOT consumer):
+    Default sample_rate = 10
+    Deterministic MD5 hash on event_id:
+      h = int(hashlib.md5(event_id.encode()).hexdigest(), 16)
+      enrich = (h % sample_rate) == 0
+    Hard cost guard: pre-flight check current Bedrock CW Invocations + Tokens;
+                     if at cap, skip enrichment + persist enrichment=NULL +
+                     emit EMF metric budget_guard_skipped
+    Day 10 dynamic tuning: if rolling_5min_throttle_rate > 0.05:
+                              sample_rate *= 2 (clamp at 100)
+
+- Failure routing (reuses Day 4 PipelineError ladder):
+    ValidationError      → quarantine/<learner>/stream_invalid/<reason>/
+    MalformedRowError    → quarantine/<learner>/stream_invalid/parse_error/
+    BedrockThrottleError → batchItemFailures + EMF bedrock_throttled metric
+                           + dynamically lower sample_rate
+    TransientError       → batchItemFailures
+    ConfigError          → SNS escalate
+
+- State machine: inference-pipeline-<learner>
+    StartAt: BedrockEnrich
+    BedrockEnrich Task → Lambda accelya-bedrock-enrich-<learner>
+      Retry: BedrockThrottleError → 2s × MaxAttempts 3, BackoffRate 2.0
+      Catch: States.ALL → ResultPath $.error → Next Quarantine
+      Next: Persist
+    Persist Task → Lambda accelya-persist-enriched-<learner>
+      End: true
+    Quarantine Pass state
+      End: true
+
+- ESM config (LAB-SAFE explicit defaults — set EVERY ONE explicitly):
+    BatchSize:                       100
+    MaximumBatchingWindowInSeconds:  5
+    ParallelizationFactor:           1
+    MaximumRetryAttempts:            3       (NEVER -1)
+    MaximumRecordAgeInSeconds:       3600    (NEVER -1)
+    BisectBatchOnFunctionError:      true
+    StartingPosition:                LATEST  (TRIM_HORIZON for cold start)
+    FunctionResponseTypes:           [ReportBatchItemFailures]
+    DestinationConfig.OnFailure:     stream-dlq-<learner>
+
+- Observability:
+    Consumer EMF: records_in, records_quarantined, handoff_succeeded,
+                  handoff_already_exists, records_failed, iterator_age_ms
+                  Dimensions: StreamName, ShardId
+    bedrock-enrich EMF: bedrock_invoked, bedrock_skipped, bedrock_throttled,
+                        input_tokens, output_tokens, budget_guard_skipped
+                        Dimensions: ModelId, Function
+
+- Forbidden:
+    - Side-effect (S3, SFN, Bedrock) before idempotency-claim
+    - Reporting all failures (must be oldest only)
+    - random.random() sampling
+    - Synchronous Bedrock per record at full volume
+    - Non-deterministic SFN execution name (no uuid4, no timestamp)
+    - Accepting ESM AWS defaults (-1 retries, no bisect)
+
+## CATALOG CONTEXT
+# (unchanged from v3 — see .windsurfrules-v3.template for full block)
+
+## EXAMPLES
+- Cancellation envelope (input to producer):
+    { event_id, event_type: 'cancellation', event_time, ingest_time,
+      airline_code: 'AI', booking_date: '2026-05-09', pnr: '6X7Y8Z',
+      source_system: 'GDS',
+      payload: { pnr, cancel_reason_code: 'WX', cancellation_event_id } }
+- Enriched record (output of state machine):
+    { ...envelope,
+      enrichment: { sentiment: 'neutral', priority: 'normal', summary: '...' }
+                   OR null (sampled out OR budget guard fired),
+      sampled: true | false,
+      enriched_at: '<iso8601>',
+      consumer_seq: '<sequence_number>',
+      consumer_shard: 'shardId-000000000000',
+      sfn_execution_arn: '...' }
+- Idempotency claim (stream_seen_keys table):
+    PK 'stream#accelya-bookings-stream-<learner>#shardId-000000000000#<seq>'
+    Item: { pk, status: 'CLAIMED|IN_PROGRESS|COMPLETED', claimed_at, ttl }
+- Stream-state DDB table:
+    stream_seen_keys_<learner>: stream/event idempotency
+    consumer_state_<learner>:   Day-10 dynamic sample_rate (NEW)
+- ASL state names (inference-pipeline.asl.json):
+    BedrockEnrich (Task) → Persist (Task)
+                        ↘ Quarantine (Pass) on States.ALL catch
+- Reference artefacts:
+    src/producer/handler.py + src/consumer/handler.py + src/bedrock_enrich/handler.py +
+    src/persist_enriched/handler.py + infra/inference-pipeline.asl.json
+    (Day 5: chunker / validator_m5 / lander / dlq_replayer)
+    (Day 6: etl_json_to_parquet)
+    sql/m6-reconciliation-5.sql
+
+## REVIEW
+- 7-dim HITL checklist:
+    Correctness · Safety · Idempotency · Observability · Cost ·
+    Schema Discipline (D6) · Per-PK Ordering (D7)
+- HITL_REVIEW-<artefact>.md committed; PASS at >=17/21 AND every dim >=2/3
+- Schema Discipline checks (carry-over from v3): see v3 template
+- Per-PK Ordering checks (carry-over from v4): see v4 template
+- Streaming-specific REVIEW rules (NEW in v5):
+    - Consumer is THIN (no Bedrock/SFN-side-effects inline)
+    - All 4 stages in order: claim → validate → start_execution → mark_completed
+    - exec_name = f'enrich-{event_id}' (deterministic)
+    - ExecutionAlreadyExists caught as success
+    - itemIdentifier = sequence_number (NOT messageId)
+    - Report only OLDEST failure per shard
+    - Sampling: MD5 hash on event_id, NOT random.random()
+    - Hard cost guard env vars present + checked
+- ESM creation MUST include all 6 explicit flags
+- batchItemFailures KINESIS: itemIdentifier = sequence_number;
+                              transient infra failures only;
+                              schema/validation → quarantine + ACK
+- batchItemFailures SQS: itemIdentifier = messageId (different from Kinesis)
+- Region: every CLI example uses --region ap-south-1
+- Synthetic data only.

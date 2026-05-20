@@ -1,0 +1,124 @@
+# Day 8 — 11-layer prompt template for streaming runtime implementation
+#
+# Layer slots: ROLE · REPO RULES · CONSTRAINTS · ASL CHUNK CONTEXT ·
+#              SQS PARTIAL-BATCH CONTEXT · STREAM CONTEXT · STATE CONTEXT ·
+#              CATALOG CONTEXT · EXAMPLES · TASK · OUTPUT FORMAT · REVIEW
+#
+# Cascade reads .windsurfrules v5 implicitly; this prompt focuses on the
+# TASK + OUTPUT FORMAT layers for Day-8 producer + consumer + bedrock-enrich.
+
+[LAYER 1] ROLE
+You are an AWS-native streaming engineer authoring production-quality
+Lambdas + ASL state machine for real-time event processing.
+
+[LAYER 2] REPO RULES
+- Read .windsurfrules v5 at repo root before generating.
+- All commands target ap-south-1.
+- Lambdas land in src/{producer,consumer,bedrock_enrich,persist_enriched}/handler.py.
+- State machine lands in infra/inference-pipeline.asl.json.
+- Common exceptions extend src/common/exceptions.py (NEW: BedrockThrottleError).
+
+[LAYER 3] CONSTRAINTS
+- Bedrock budget 50 inv + 20K tokens (cumulative); ~25 used through Day 7.
+- HARD COST GUARD env vars on bedrock-enrich: BEDROCK_MAX_INVOCATIONS=38,
+  BEDROCK_MAX_TOKENS=18000.
+- Lambda count: 6 of 10 used; today adds 3-4 → 9 of 10.
+- Region locked: ap-south-1.
+
+[LAYER 4-8] (inherited from .windsurfrules v5 — do not duplicate)
+
+[LAYER 9] EXAMPLES
+- Stream name: accelya-bookings-stream-<learner>
+- State machine: inference-pipeline-<learner>
+- Idempotency table: stream_seen_keys_<learner>
+- Model: apac.anthropic.claude-3-5-sonnet-20241022-v2:0
+
+[LAYER 10] TASK
+Author the four streaming Lambdas + state machine with these contracts:
+
+(A) src/producer/handler.py
+    Event:  { "events": [<envelope>, ...] }  (≤500 per call)
+    Return: { submitted_count, failed_count, failed_records[] }
+    Behavior:
+      - Pre-validate each envelope (raise ValidationError pre-submit)
+      - Bulk PutRecords; PartitionKey = f"{airline_code}:{booking_date}:{bucket_hash(pnr)%8}"
+      - On per-record PutRecords failure (ProvisionedThroughputExceededException):
+          backoff+jitter, retry the failed records only, cap 5 retries
+      - EMF: records_in, records_failed, retry_count (tags: stream_name, airline_code)
+
+(B) src/consumer/handler.py — THE THIN CONSUMER
+    Event:  ESM { "Records": [{ "kinesis": {partitionKey, sequenceNumber, data},
+                                 "eventID": "shardId-...:sequenceNumber" }, ...] }
+    Return: { "batchItemFailures": [{"itemIdentifier": "<oldest_failed_seq>"}] }
+    Four stages (in order, per record):
+      1. Claim stream_seen_keys PK = f"stream#{STREAM}#{shard_id}#{seq}"
+         (ConditionalPut, attribute_not_exists)
+         Duplicate → silent skip
+      2. base64 decode data; validate envelope; ValidationError → quarantine + ACK
+      3. sfn.start_execution(stateMachineArn=SM_ARN, name=f"enrich-{event_id}", input={...})
+         ExecutionAlreadyExists → idempotent skip
+      4. UpdateItem stream_seen_keys.pk: status = COMPLETED
+    Failure handling:
+      - ValidationError    → quarantine/<learner>/stream_invalid/<reason>/  (ACK, not failure)
+      - TransientError     → append seq to failures
+      - Report ONLY the oldest failure per shard
+    NO inline Bedrock. NO inline S3 enriched writes. NO non-deterministic exec names.
+
+(C) src/bedrock_enrich/handler.py
+    Step Functions Task invocation. Sampled enrichment.
+    Steps:
+      1. should_enrich(event_id, SAMPLE_RATE): MD5 % SAMPLE_RATE == 0
+         If false → return {**event, enrichment: None, sampled: False}
+      2. Pre-flight CW budget check: AWS/Bedrock Invocations + Tokens for today
+         vs BEDROCK_MAX_INVOCATIONS / BEDROCK_MAX_TOKENS
+         If at cap → return {**event, enrichment: None, sampled: True,
+                              budget_guard_skipped: True}
+      3. boto3.client('bedrock-runtime').invoke_model with apac Sonnet profile;
+         tight prompt (~150 in / ~100 out tokens); max_tokens=256
+         Exceptions:
+           ThrottlingException / ServiceUnavailableException → raise BedrockThrottleError
+           AccessDeniedException → raise ConfigError
+      4. EMF: bedrock_invoked / bedrock_skipped / bedrock_throttled /
+              budget_guard_skipped / input_tokens / output_tokens
+              (Dimensions: ModelId, Function)
+    Return: {**event, enrichment, sampled, enriched_at}
+
+(D) src/persist_enriched/handler.py
+    Step Functions Task. Writes enriched record to S3.
+    Path: enriched/<learner>/ingest_date=YYYY-MM-DD/source_system=GDS/events-<event_id>.jsonl.gz
+    Gzip-compress JSON line; ContentEncoding=gzip.
+    Return: { persisted_key, outcome: "persisted" }
+
+(E) infra/inference-pipeline.asl.json
+    StartAt: BedrockEnrich
+    BedrockEnrich Task → accelya-bedrock-enrich-<learner>
+      Retry: BedrockThrottleError → 2s × 3 backoff 2.0
+      Retry: Lambda.* exceptions → 2s × 3 backoff 2.0
+      Catch: States.ALL → ResultPath $.error → Next Quarantine
+      Next: Persist
+    Persist Task → accelya-persist-enriched-<learner>
+      Retry: Lambda.* exceptions → 2s × 3 backoff 2.0
+      End: true
+    Quarantine Pass state → End: true
+
+(F) src/common/exceptions.py
+    Add: class BedrockThrottleError(PipelineError): quarantine_reason = "bedrock_throttle"
+
+[LAYER 11] OUTPUT FORMAT
+- handler(event, context) signature on all 4 Lambdas
+- Type hints: Python 3.12 (`from __future__ import annotations`)
+- Imports: stdlib + boto3 only
+- ASL: pure JSON (no comments)
+- Logger: structured JSON via logging stdlib
+- Idempotent: re-running the script produces no spurious side-effects
+
+[LAYER 12] REVIEW
+Self-grade on 7 dimensions (Day 7 baseline + Per-PK Ordering):
+- Correctness:    All 4 stages in order; deterministic exec name
+- Safety:         Pre-submit validation; no PII in logs
+- Idempotency:    Claim BEFORE side-effect; ExecutionAlreadyExists caught
+- Observability:  EMF per Lambda; corr_id propagated
+- Cost:           Sampling in bedrock-enrich; hard cost guard present
+- Schema Discipline: Custom exception ladder; structured persist key
+- Per-PK Ordering: Producer PK formula deterministic; consumer PK = sequence-number-based
+Pass threshold: ≥17/21 AND every dim ≥2/3.
