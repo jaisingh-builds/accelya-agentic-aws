@@ -7,7 +7,8 @@ calibrated features that the cancel-risk model maps to high or low
 confidence — so we can prove the ASL HasLowConfidence Choice routes
 correctly.
 
-Calibration assumes the trainer's reference logistic-regression model:
+Calibration assumes the reference logistic-regression model from
+src/m9_model/inference.py (trained in-container deterministically):
   - High-confidence inputs: extreme features (large fare, immediate refund,
     or no refund) → model outputs confidence > 0.7
   - Low-confidence inputs: ambiguous features (mid-range everything) →

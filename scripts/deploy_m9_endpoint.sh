@@ -136,14 +136,19 @@ echo "[2/4] SageMaker Model: $MODEL_NAME"
 if aws sagemaker describe-model --model-name "$MODEL_NAME" --region "$REGION" >/dev/null 2>&1; then
   echo "  ✓ Model exists (delete via reset script if config changed)"
 else
+  # IMPORTANT: SAGEMAKER_PROGRAM env var tells the prebuilt sklearn container
+  # which Python file inside the tarball's code/ folder to load as the
+  # inference handler. SAGEMAKER_SUBMIT_DIRECTORY points at the tarball root.
+  # Without these, the container falls back to default I/O handlers that don't
+  # speak JSON and will return 400 to every payload.
   aws sagemaker create-model \
     --model-name "$MODEL_NAME" \
-    --primary-container "Image=$INFERENCE_IMAGE,ModelDataUrl=$MODEL_ARTEFACT" \
+    --primary-container "Image=$INFERENCE_IMAGE,ModelDataUrl=$MODEL_ARTEFACT,Environment={SAGEMAKER_PROGRAM=inference.py,SAGEMAKER_SUBMIT_DIRECTORY=/opt/ml/model/code,SAGEMAKER_CONTAINER_LOG_LEVEL=20,SAGEMAKER_REGION=$REGION}" \
     --execution-role-arn "$SAGEMAKER_ROLE_ARN" \
     --region "$REGION" \
     --tags Key=programme,Value=accelya-agentic-aws Key=module,Value=m9 \
            Key=learner,Value="$LEARNER" >/dev/null
-  echo "  ✓ Model created"
+  echo "  ✓ Model created (SAGEMAKER_PROGRAM=inference.py, code/ dir convention)"
 fi
 
 # ── 3. Endpoint Config ────────────────────────────────────────────────────

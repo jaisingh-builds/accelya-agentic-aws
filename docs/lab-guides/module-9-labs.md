@@ -40,6 +40,26 @@ Close all Cascade chats. MODEL CONTEXT pickup test is in Lab 2.
 
 ---
 
+## ⚡ Single-paste fast path (if you've fallen behind)
+
+If you're short on time and want to deploy everything Lab 1 + Lab 2 ask for in one go:
+
+```bash
+bash scripts/deploy_m9_full_stack.sh $LEARNER
+```
+
+This script does steps 1-5 of Lab 1 + steps 1-4 of Lab 2 automatically (model
+artefact + IAM + endpoint + wrapper Lambda + SQS review queue + ASL update +
+smoke test). It's the same code path the trainer runs; idempotent; ~5 min total.
+
+If you want to learn what each step does, follow the manual steps below instead.
+
+> **Sandbox cap warning:** only ONE SageMaker endpoint allowed per AWS account
+> at a time. If another learner has one running, coordinate — only one
+> endpoint deploys at once. Delete yours at end of Lab 3.
+
+---
+
 ## Lab 1 — Deploy SageMaker Serverless endpoint (45 min, PAIRS)
 
 **Deliverable:** Endpoint ACTIVE; smoke-test returns valid response with `risk_score+confidence+model_version`; `ModelSetupTime` cold-start metric > 0; `/reviews/m9-endpoint-smoke-test.md`; `prompts/v12_model.txt` + `.windsurfrules` v6 committed.

@@ -191,8 +191,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
         # Other ModelError / non-retryable
         _emit_emf(metrics, endpoint_name, corr_id)
+        err_msg = e.response.get("Error", {}).get("Message", "")
         raise PipelineError(
-            f"invoke failed: {code} status={status}",
+            f"invoke failed: {code} status={status} msg={err_msg!r}",
             detail=str(e),
         ) from e
 

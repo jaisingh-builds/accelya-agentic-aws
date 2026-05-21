@@ -25,9 +25,43 @@ MODEL_VERSION = "v1.2.3"
 
 
 def model_fn(model_dir: str) -> Any:
-    """Load the joblib-serialised model from model_dir at container start."""
-    import joblib
-    return joblib.load(os.path.join(model_dir, "model.joblib"))
+    """Train a tiny LogisticRegression IN-CONTAINER on container start.
+
+    Why not joblib.load:
+      The training side (trainer's laptop) ships with sklearn 1.5+. The
+      SageMaker prebuilt sklearn-1.2 container has sklearn 1.2.x. A
+      LogisticRegression pickled by 1.5 lacks the `multi_class` attribute
+      that 1.2's `predict_proba` requires, so the container raises
+      `AttributeError: 'LogisticRegression' object has no attribute
+      'multi_class'` on every invoke.
+
+    Working around it by training inside the container — fast (<200 ms for
+    2K rows × 4 features), deterministic via fixed seed, uses the container's
+    own sklearn version so all attributes line up.
+
+    Production WOULD pin sklearn versions on both sides and ship a real
+    artefact. This is a lab pattern, not production guidance.
+    """
+    import sys
+    import numpy as np
+    import sklearn
+    from sklearn.linear_model import LogisticRegression
+
+    print(f"[model_fn] container sklearn version: {sklearn.__version__}",
+          file=sys.stderr)
+    print(f"[model_fn] training in-container (avoiding cross-version "
+          f"joblib mismatch)", file=sys.stderr)
+
+    rng = np.random.default_rng(20260520)
+    X = rng.random((2000, 4))
+    # Synthetic label: high risk when fare is high AND priors exist AND lag
+    # is short OR long
+    y = ((X[:, 0] > 0.5) & (X[:, 3] > 0.5) &
+         ((X[:, 1] < 0.2) | (X[:, 1] > 0.6))).astype(int)
+    m = LogisticRegression(max_iter=1000).fit(X, y)
+    print(f"[model_fn] trained LR: classes={m.classes_}, "
+          f"coef_shape={m.coef_.shape}", file=sys.stderr)
+    return m
 
 
 def input_fn(request_body: str | bytes, request_content_type: str) -> dict:
