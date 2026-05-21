@@ -1,0 +1,219 @@
+# .windsurfrules — v6 (Day 9 Lab 1 target state)
+#
+# MODEL CONTEXT block inserted between STATE CONTEXT and CATALOG CONTEXT.
+# Day 10 adds OBSERVABILITY CONTEXT → v7. Day 11 adds DEPLOY CONTEXT → v8.
+
+## REPO RULES
+- Lambdas: src/<component>/handler.py + tests/test_<component>.py
+- ASL state machines: infra/*.asl.json
+- Glue + Athena: scripts/provision_m6_glue.sh + sql/m6-*.sql
+- Kinesis + DDB streaming: scripts/provision_m7_stream.sh + design/m7-*.md
+- Streaming Lambdas + ASL (D8): scripts/deploy_m8_lambdas.sh + infra/inference-pipeline.asl.json
+- SageMaker endpoint (D9): scripts/deploy_m9_endpoint.sh + src/predict/handler.py
+- IaC: infra/template.yaml (AWS SAM)
+- Audit folders (committed): prompts/ reviews/ design/ sql/
+- Region locked: ap-south-1
+- Branches: module-N-<learner>; MRs only.
+
+## CONSTRAINTS
+- Bedrock: invoke via APAC inference PROFILE:
+    apac.anthropic.claude-3-5-sonnet-20241022-v2:0
+- Bedrock budget: max 50 invocations + 20,000 tokens per learner per session.
+- Bedrock HARD COST GUARD: BEDROCK_MAX_INVOCATIONS=38, BEDROCK_MAX_TOKENS=18000
+- Bedrock FORBIDDEN: Studio, Knowledge Bases, Agents, AgentCore.
+- Lambda: max 10 functions per learner (FINAL CAP); max 2048 MB; python3.12.
+- SageMaker: max 1 endpoint per learner; serverless ONLY (no provisioned);
+  no GPU; MUST be deleted at end of Lab 3.
+- Glue: max 3 jobs; max 4 DPU/job; max 6 DPU-h cumulative.
+- DynamoDB: PAY_PER_REQUEST billing.
+- Kinesis: 2 shards per stream (sandbox default).
+- Step Functions: 256 KiB state limit.
+- Athena: workgroup accelya_<learner> with 100 MB bytes-scanned cap.
+- GitHub: public starter repo.
+
+## ASL CHUNK CONTEXT
+# (unchanged from v2)
+
+## SQS PARTIAL-BATCH CONTEXT
+# (unchanged from v2)
+
+## STREAM CONTEXT
+# (unchanged from v4)
+
+## STATE CONTEXT
+# (unchanged from v5)
+
+## MODEL CONTEXT
+# Use this block when Cascade scaffolds the predict-wrapper Lambda or the
+# ASL Parallel branch that invokes SageMaker. Applies from Day 9 forward.
+
+- Model name:     accelya-cancel-risk
+- Model version:  v1.2.3
+- Endpoint:       accelya-cancel-risk-<learner>  (SageMaker Serverless)
+- Region:         ap-south-1
+- Endpoint config:
+    MemorySizeInMB:  1024
+    MaxConcurrency:  5
+    VariantName:     AllTraffic
+    InitialVariantWeight: 1.0
+    NOTE: Do NOT set InitialInstanceCount or InstanceType — ValidationException.
+
+- Wrapper Lambda contract:
+    Function: accelya-predict-cancel-risk-<learner>
+    Runtime:  python3.12 (x86_64)
+    Memory:   512 MB
+    Timeout:  45 s     (MUST be > boto3 read_timeout 35 s + parse buffer)
+    Env:      ENDPOINT_NAME, CONFIDENCE_THRESHOLD (default '0.7')
+
+- Input shape (wrapper Lambda payload):
+    { booking_id:        str,
+      fare_amount:       float,
+      refund_lag_hours:  float,
+      prior_cancels:     int }
+
+- Output shape (wrapper Lambda return):
+    { risk_score:       0..1,
+      confidence:       0..1,
+      model_version:    str,
+      low_confidence:   true | false,    # NORMAL OUTPUT FLAG, not exception
+      model_latency_ms: int,
+      fallback_used:    optional bool }  # set true if endpoint down
+
+- Confidence threshold: 0.7 (trainer-calibrated; env-driven, NOT hardcoded)
+
+- Below-threshold action (HOW low-confidence is handled):
+    Wrapper sets low_confidence:true (NORMAL OUTPUT, NOT exception).
+    ASL Choice HasLowConfidence routes:
+        true  → WriteReviewSinks (SQS + S3 audit) → Persist
+        false → Persist
+    NEVER raise LowConfidencePrediction — that's Catch semantics for errors;
+    low-conf is data, not an error.
+
+- Fallback (endpoint down):
+    ModelFailedFallback Pass state emits:
+        { risk_score: null, confidence: null,
+          low_confidence: true, fallback_used: true }
+    Downstream uses Bedrock-derived risk if available; record persisted with flag.
+
+- Cold-start expectations:
+    ModelSetupTime 1-6 s on first request after idle (~5-15 min, AWS-managed).
+    Warm ModelLatency: 50-300 ms.
+    ASL Retry interval: 10 s × 2 for EndpointColdStartTimeout (longer interval
+    gives previous request time to populate warm pool).
+
+- Timeout LOCKSTEP rule:
+    ASL retry interval (10s)  <  boto3 read_timeout (35s)  <  Lambda timeout (45s)
+    Violation: slow cold-start gets killed by Lambda runtime BEFORE boto3 raises,
+               BEFORE ASL can retry. You lose EndpointColdStartTimeout diagnostic.
+
+- Custom exceptions (NEW in v6 — extend src/common/exceptions.py):
+    EndpointColdStartTimeout(PipelineError):
+        quarantine_reason = "endpoint_cold_start"
+        - wrapper timed out waiting on cold endpoint; transient
+        - ASL Retry: interval=10s, MaxAttempts=2, BackoffRate=1.5
+
+    EndpointThrottleException(PipelineError):
+        quarantine_reason = "endpoint_throttle"
+        - SageMaker MaxConcurrency exceeded; transient
+        - ASL Retry: interval=2s, MaxAttempts=3, BackoffRate=2.0
+
+    DO NOT ADD LowConfidencePrediction — low-conf is NORMAL OUTPUT.
+
+- Wrapper exception mapping:
+    (ReadTimeoutError, ConnectTimeoutError) → EndpointColdStartTimeout
+    ClientError.Code == 'ServiceUnavailableException' OR HTTP 503 → EndpointThrottleException
+    ClientError.Code in ('ModelError', 'InternalFailure') AND HTTP 504 → EndpointColdStartTimeout
+    ClientError.Code == 'ModelError' (non-504) → PipelineError (non-retryable)
+    Other ClientError → PipelineError
+    Body parse failures (KeyError, ValueError, JSONDecodeError) → PipelineError
+
+- boto3 client config (wrapper Lambda):
+    sm = boto3.client('sagemaker-runtime',
+                      region_name='ap-south-1',
+                      config=Config(connect_timeout=5,
+                                    read_timeout=35,
+                                    retries={'max_attempts': 0}))  # ASL owns retry
+
+- Body parsing 5-step checklist (every wrapper call):
+    1. resp['Body'] is a StreamingBody → must .read() (returns bytes)
+    2. .decode('utf-8') BEFORE json.loads (some models return non-ASCII)
+    3. Validate model_version field present (catches stale endpoint cache)
+    4. Coerce numerics (some endpoints stringify floats)
+    5. Wrap parse errors as PipelineError, NOT ValueError (so ASL Catch fires)
+
+- invoke_endpoint required parameters:
+    EndpointName  = ENDPOINT_NAME env var
+    ContentType   = 'application/json'   (REQUIRED; missing → HTTP 415)
+    Accept        = 'application/json'   (REQUIRED)
+    Body          = json.dumps(payload).encode('utf-8')
+
+- State machine extension (same inference-pipeline-<learner>, NOT new):
+    StartAt: EnrichInParallel (was BedrockEnrich)
+      Parallel branches:
+        Branch 1: BedrockEnrich  (existing Day-8 Lambda)
+        Branch 2: PredictCancelRisk → ModelFailedFallback (Catch route)
+    ResultPath: $.parallel
+    Next: HasLowConfidence (Choice)
+      true  → WriteReviewSinks (Parallel: SQS + S3 audit) → Persist
+      false → Persist
+
+- Pre-update validation MANDATORY:
+    aws stepfunctions validate-state-machine-definition \
+      --definition file://infra/inference-pipeline.asl.json
+    Expected: {"result": "OK", "diagnostics": []}
+    A malformed update returns 200 OK but next StartExecution fails with States.Runtime.
+
+- Forbidden patterns:
+    - Calling SageMaker Runtime from inside the consumer Lambda
+    - Multiple endpoints (sandbox cap = 1)
+    - GPU instance types (ml.g*, ml.p* — sandbox blocks)
+    - invoke_endpoint without ContentType='application/json' (HTTP 415)
+    - Hardcoding endpoint name (use ENDPOINT_NAME env var)
+    - random.random() in confidence routing (deterministic only)
+    - Raising LowConfidencePrediction (confidence is data, not exception)
+    - Setting InitialInstanceCount or InstanceType alongside ServerlessConfig
+    - Leaving endpoint running at end of session
+
+## CATALOG CONTEXT
+# (unchanged from v3)
+
+## EXAMPLES
+- Cancellation envelope: see v4 EXAMPLES
+- Settlement record: see v3 EXAMPLES
+- Stream idempotency: see v4 EXAMPLES
+- SageMaker invoke payload:
+    {"booking_id":"BK-...", "fare_amount":2845.00,
+     "refund_lag_hours":2.5, "prior_cancels":0}
+- SageMaker response body:
+    {"risk_score":0.72, "confidence":0.81, "model_version":"v1.2.3"}
+- Wrapper Lambda return shape:
+    {"risk_score":0.72, "confidence":0.81, "model_version":"v1.2.3",
+     "low_confidence":false, "model_latency_ms":124}
+- Reference artefacts (Day 9):
+    src/predict/handler.py (wrapper Lambda)
+    src/common/exceptions.py (+EndpointColdStartTimeout, +EndpointThrottleException)
+    infra/inference-pipeline.asl.json (Parallel + Choice extended)
+    scripts/deploy_m9_endpoint.sh, scripts/reset_module9_endpoint.sh
+
+## REVIEW
+- 8-dim HITL checklist (Confidence Handling added in v6):
+    Correctness · Safety · Idempotency · Observability · Cost ·
+    Schema Discipline (D6) · Per-PK Ordering (D7) · Confidence Handling (D9 — NEW)
+- HITL_REVIEW-<artefact>.md committed; PASS at >=19/24 AND every dim >=2/3
+- Confidence Handling — 5 sub-checks (0-3 each, max 15; pass ≥10/15):
+    1. Confidence threshold EXPLICIT (numeric, env-driven, not "TBD")
+    2. Low-confidence path NAMED (review queue / quarantine / default value)
+    3. Confidence PERSISTED alongside prediction (downstream sees both)
+    4. Threshold CALIBRATED (held-out labels in prod; trainer-calibrated in lab)
+    5. Confidence-distribution ALERT (CW metric; Day 10 wires alarm)
+- Schema Discipline checks: carry from v3 (partition pruning, columnar projection,
+  no JSON in curated/, etc.)
+- Per-PK Ordering checks: carry from v4 (deterministic PK; SequenceNumberForOrdering)
+- 12-layer prompt (NEW): prompts/v12_model.txt includes MODEL CONTEXT layer slot
+- ASL Catch semantics:
+    Use Catch for ERRORS (Lambda exceptions, States.TaskFailed)
+    Use Choice for DATA-DRIVEN ROUTING (low_confidence flag, event_type, etc.)
+    Never raise to route on data.
+- IAM: NEVER wildcards; named verbs + ARN-scoped resources.
+- Region: every CLI uses --region ap-south-1.
+- Synthetic data only.

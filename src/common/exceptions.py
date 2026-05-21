@@ -49,6 +49,8 @@ __all__ = [
     "ManifestMismatchError",
     "SchemaInferenceError",
     "BedrockThrottleError",
+    "EndpointColdStartTimeout",
+    "EndpointThrottleException",
 ]
 
 
@@ -154,6 +156,28 @@ class ManifestMismatchError(PipelineError):
     to the chunker's reported `row_count`. ASL Catch routes to QuarantinePartial.
     """
     quarantine_reason = "partial"
+
+
+# ── SageMaker endpoint exceptions (Day 9 — predict wrapper Lambda) ────────
+class EndpointColdStartTimeout(PipelineError):
+    """Wrapper Lambda timed out waiting on a cold SageMaker endpoint.
+
+    Transient — ASL Retry policy (interval=10s, MaxAttempts=2, BackoffRate=1.5)
+    gives cold-start time to complete and warm pool to populate.
+
+    NOTE: NOT for low confidence — low_confidence is a normal output flag,
+    routed via ASL Choice, not Catch.
+    """
+    quarantine_reason = "endpoint_cold_start"
+
+
+class EndpointThrottleException(PipelineError):
+    """SageMaker endpoint MaxConcurrency exceeded (HTTP 503 ServiceUnavailable).
+
+    Transient — ASL Retry policy (interval=2s, MaxAttempts=3, BackoffRate=2.0)
+    gives concurrent requests time to drain.
+    """
+    quarantine_reason = "endpoint_throttle"
 
 
 # ── Bedrock throttle (Day 8 — bedrock-enrich Lambda) ──────────────────────

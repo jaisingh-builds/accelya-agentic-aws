@@ -1,0 +1,127 @@
+# Day 9 — 12-layer prompt template for SageMaker wrapper Lambda + ASL extension
+#
+# Layer slots: ROLE · REPO RULES · CONSTRAINTS · ASL CHUNK CONTEXT ·
+#              SQS PARTIAL-BATCH CONTEXT · STREAM CONTEXT · STATE CONTEXT ·
+#              MODEL CONTEXT · CATALOG CONTEXT · EXAMPLES · TASK ·
+#              OUTPUT FORMAT · REVIEW
+#
+# Cascade reads .windsurfrules v6 implicitly; this prompt focuses on the
+# TASK + OUTPUT FORMAT layers for Day-9 wrapper Lambda + ASL Parallel branch.
+
+[LAYER 1] ROLE
+You are an AWS-native ML engineer authoring the SageMaker Serverless
+wrapper Lambda + the ASL state machine extension that forks BedrockEnrich
+into a Parallel with two branches.
+
+[LAYER 2] REPO RULES
+- Read .windsurfrules v6 at repo root before generating.
+- All commands target ap-south-1.
+- Lambda lands in src/predict/handler.py.
+- ASL extension lands in infra/inference-pipeline.asl.json (UPDATE IN PLACE).
+- Custom exceptions extend src/common/exceptions.py
+  (NEW: EndpointColdStartTimeout, EndpointThrottleException).
+
+[LAYER 3] CONSTRAINTS
+- Sandbox cap: 1 SageMaker endpoint per learner. Sandbox blocks GPU.
+- Lambda cap: 10 functions (FINAL CAP today; +1 wrapper Lambda).
+- Bedrock budget ~30 of 50 used through Day 8; Day 9 burns ~5 more.
+- Region locked: ap-south-1.
+
+[LAYER 4-9] (inherited from .windsurfrules v6 — do not duplicate)
+
+[LAYER 10] EXAMPLES
+- Endpoint: accelya-cancel-risk-<learner>
+- Wrapper Lambda: accelya-predict-cancel-risk-<learner>
+- Model artefact: s3://accelya-airline-data-ap-south-1/models/cancel-risk/v1.2.3/model.tar.gz
+- Sample input: {"booking_id":"BK-001","fare_amount":2845.0,"refund_lag_hours":2.5,"prior_cancels":0}
+- Sample output: {"risk_score":0.72, "confidence":0.81, "model_version":"v1.2.3"}
+
+[LAYER 11] TASK
+Author the four artefacts with these contracts:
+
+(A) src/predict/handler.py (NEW WRAPPER LAMBDA)
+    Event in: { booking_id, fare_amount, refund_lag_hours, prior_cancels,
+                event_id?, corr_id?, ...passthrough envelope fields }
+    Return:   { ...passthrough, risk_score, confidence, model_version,
+                low_confidence: bool, model_latency_ms: int }
+    Behavior:
+      1. Read ENDPOINT_NAME + CONFIDENCE_THRESHOLD env vars
+      2. Extract 4 features from event (support both flat + payload-nested shapes)
+      3. boto3 client config: connect_timeout=5, read_timeout=35, retries=max_attempts:0
+      4. invoke_endpoint with:
+            ContentType='application/json'
+            Accept='application/json'
+            Body=json.dumps(payload).encode('utf-8')
+      5. Exception mapping:
+            (ReadTimeoutError, ConnectTimeoutError) → raise EndpointColdStartTimeout
+            ServiceUnavailableException OR HTTP 503 → raise EndpointThrottleException
+            ModelError/InternalFailure + HTTP 504 → raise EndpointColdStartTimeout
+            ModelError (non-504) → raise PipelineError
+            Other ClientError → raise PipelineError
+      6. Body parsing 5-step:
+            .read() → bytes
+            .decode('utf-8') BEFORE json.loads
+            Validate model_version field
+            Coerce numerics
+            Wrap parse errors as PipelineError, NOT ValueError
+      7. low_confidence = confidence < THRESHOLD (NORMAL OUTPUT FLAG)
+      8. EMF metrics: model_invoked, low_confidence, fallback_used,
+                       cold_start_timeout, throttle_exception,
+                       model_latency_ms, confidence
+                       (Dimensions: EndpointName, Function)
+
+(B) src/common/exceptions.py — ADD ONLY TWO:
+    class EndpointColdStartTimeout(PipelineError):
+        quarantine_reason = "endpoint_cold_start"
+    class EndpointThrottleException(PipelineError):
+        quarantine_reason = "endpoint_throttle"
+    DO NOT add LowConfidencePrediction.
+
+(C) infra/inference-pipeline.asl.json — UPDATE IN PLACE
+    StartAt: EnrichInParallel (Parallel)
+      Branch 1: BedrockEnrich (existing Lambda, OutputPath: $.Payload)
+                + Catch States.ALL → BedrockFallback (Pass)
+      Branch 2: PredictCancelRisk (new wrapper Lambda)
+                + Retry: EndpointColdStartTimeout interval=10, MaxAttempts=2, BackoffRate=1.5
+                + Retry: EndpointThrottleException interval=2,  MaxAttempts=3, BackoffRate=2.0
+                + Retry: Lambda.* errors interval=2, MaxAttempts=3, BackoffRate=2.0
+                + Catch: States.TaskFailed → ModelFailedFallback (Pass)
+      ResultPath: $.parallel
+      Next: HasLowConfidence
+    HasLowConfidence (Choice):
+      Variable: $.parallel[1].low_confidence, BooleanEquals: true
+      → WriteReviewSinks
+      Default → Persist
+    WriteReviewSinks (Parallel):
+      Branch 1: WriteSQS (arn:...:sqs:sendMessage to MODEL_REVIEW_QUEUE_URL)
+      Branch 2: WriteAuditS3 (arn:...:aws-sdk:s3:putObject to review/<learner>/...)
+      Next: Persist
+    Persist Task → accelya-persist-enriched-<learner>, End: true
+
+(D) scripts/deploy_m9_endpoint.sh
+    1. Create IAM role accelya-sagemaker-role-<learner> with S3 read + CW logs + ECR pull
+    2. create-model with sklearn 1.2-1-cpu-py3 image + s3://.../model.tar.gz
+    3. create-endpoint-config with ServerlessConfig{1024, 5} (NOT InstanceType)
+    4. create-endpoint + wait endpoint-in-service
+    Idempotent.
+
+[LAYER 12] OUTPUT FORMAT
+- handler(event, context) signature
+- Type hints: Python 3.12 (`from __future__ import annotations`)
+- Imports: stdlib + boto3 only
+- ASL: pure JSON (no comments); uses ${AWS_REGION}, ${AWS_ACCOUNT_ID}, ${LEARNER},
+       ${MODEL_REVIEW_QUEUE_URL}, ${BUCKET_NAME} placeholders for envsubst
+- Tests using moto where possible
+
+[LAYER 13] REVIEW
+Self-grade on 8 dimensions (Confidence Handling NEW in v6):
+- Correctness:       Bedrock + Predict in Parallel; Choice routes on low_confidence
+- Safety:            No PII in logs; ContentType + Accept set
+- Idempotency:       Wrapper is stateless; ASL Parallel re-runs are safe
+- Observability:     EMF per Lambda with named dimensions
+- Cost:              No GPU; MaxConcurrency=5; ASL Catch prevents runaway retries
+- Schema Discipline: model_version persisted; envelope shape preserved
+- Per-PK Ordering:   N/A (downstream of stream); inherited from Day 7-8 contracts
+- Confidence Handling (NEW): threshold env-driven; low-conf flag (NOT exception);
+                              SQS + S3 sinks; metric on confidence
+Pass threshold: ≥19/24 AND every dim ≥2/3.
