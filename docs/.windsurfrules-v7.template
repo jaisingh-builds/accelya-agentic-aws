@@ -1,0 +1,328 @@
+# .windsurfrules — v7 (Day 10 Lab 1 target state)
+#
+# OBSERVABILITY CONTEXT block inserted between MODEL CONTEXT and CATALOG CONTEXT.
+# Day 11 adds DEPLOY CONTEXT → v8.
+
+## REPO RULES
+- Lambdas: src/<component>/handler.py + tests/test_<component>.py
+- ASL state machines: infra/*.asl.json
+- Glue + Athena: scripts/provision_m6_glue.sh + sql/m6-*.sql
+- Kinesis + DDB streaming: scripts/provision_m7_stream.sh + design/m7-*.md
+- Streaming Lambdas + ASL (D8): scripts/deploy_m8_lambdas.sh + infra/inference-pipeline.asl.json
+- SageMaker endpoint (D9): scripts/deploy_m9_endpoint.sh + src/predict/handler.py
+- Observability helpers (D10): src/common/observability.py + infra/{dashboard,alarms,iam-*}-*.json
+- IaC: infra/template.yaml (AWS SAM) — Day 11
+- Audit folders (committed): prompts/ reviews/ design/ sql/
+- Region locked: ap-south-1
+- Branches: module-N-<learner>; MRs only.
+
+## CONSTRAINTS
+- Bedrock: invoke via APAC inference PROFILE:
+    apac.anthropic.claude-3-5-sonnet-20241022-v2:0
+- Bedrock budget: max 50 invocations + 20,000 tokens per learner per session.
+- Bedrock HARD COST GUARD: BEDROCK_MAX_INVOCATIONS=38, BEDROCK_MAX_TOKENS=18000
+- Bedrock FORBIDDEN: Studio, Knowledge Bases, Agents, AgentCore.
+- Lambda: max 10 functions per learner (FINAL CAP); max 2048 MB; python3.12.
+- SageMaker: max 1 endpoint per learner; serverless ONLY (no provisioned);
+  no GPU; MUST be deleted at end of Day 9 Lab 3.
+- Glue: max 3 jobs; max 4 DPU/job; max 6 DPU-h cumulative.
+- DynamoDB: PAY_PER_REQUEST billing.
+- Kinesis: 2 shards per stream (sandbox default).
+- Step Functions: 256 KiB state limit.
+- Athena: workgroup accelya_<learner> with 100 MB bytes-scanned cap.
+- GitLab: private MR-driven workflow (CodeCommit blocked).
+- AWS Cost Anomaly Detection: 1 DIMENSIONAL monitor per account (sandbox-shared).
+  REUSE the auto-created `Default-Services-Monitor`; do NOT create a second.
+
+## DAILY RESET CONTEXT
+# Pluralsight sandbox WIPES every night. The learner's AWS account has zero
+# resources at 09:00 every morning. EVERY Lambda, queue, table, stream, role,
+# state machine, endpoint, dashboard, alarm, monitor must be recreated daily.
+#
+# Implication for Cascade:
+# - NEVER assume a resource exists. Always verify (describe-* / get-* / list-*)
+#   before referencing.
+# - Idempotent code only — every infra mutation must be "create-or-update".
+# - Resolve ALL IDs at runtime: account ID via `aws sts get-caller-identity`,
+#   queue URLs via `aws sqs get-queue-url`, role ARNs via `aws iam get-role`.
+#   NEVER hard-code account numbers, ARNs, queue URLs.
+# - Learner runs `bash scripts/bootstrap_day10.sh <learner>` at start of day
+#   (or invokes `/day10-bootstrap` Cascade workflow). This brings up everything
+#   Days 1-9 created, plus the SageMaker endpoint, plus Day-10 prep.
+# - If Cascade is asked to "deploy X", first check if X exists. If yes, update.
+#   If no, create. NEVER skip the check.
+# - At end of day, learner runs `bash scripts/bootstrap_day10.sh <learner> --teardown`
+#   to free shared caps (especially the SageMaker endpoint cap).
+
+## KNOWN-ERROR REGISTER (Day-10 sandbox quirks)
+# Cascade: if you see any of these errors verbatim, apply the noted fix WITHOUT
+# asking the user. These are sandbox-API quirks discovered the hard way; the
+# fix is mechanical.
+#
+# 1. `Limit exceeded on dimensional spend monitor creation` (Cost Explorer)
+#    Cause: 1 DIMENSIONAL monitor per account.
+#    Fix:   Look up `Default-Services-Monitor`, reuse its ARN.
+#
+# 2. `Unknown parameter in Metrics[N]: "Offset"` (CloudWatch put-metric-alarm)
+#    Cause: `Offset` is console-only; API rejects it.
+#    Fix:   Use `ANOMALY_DETECTION_BAND(m_curr, 2)` with `ThresholdMetricId`
+#           and `LessThanLowerOrGreaterThanUpperThreshold` instead of a
+#           hand-rolled m_prev/m_curr math expression.
+#
+# 3. `Should NOT have more than 4 items` (CloudWatch put-dashboard)
+#    Cause: A metric tuple's math-expression object has > 4 keys, OR a metric
+#           tuple has a nested `metric: [...]` field (also rejected).
+#    Fix:   Use flat tuples `[Namespace, MetricName, DimName, DimValue, {opts}]`
+#           with at most `{expression, label, id, color}` in math objects.
+#
+# 4. `Daily or weekly frequencies only support Email subscriptions` (CE subscription)
+#    Cause: SNS subscribers require `Frequency: IMMEDIATE`.
+#    Fix:   Use IMMEDIATE; DAILY/WEEKLY are email-only.
+#
+# 5. `ResourceLimitExceeded` on `create-endpoint` (SageMaker)
+#    Cause: 1-endpoint-per-account cap; another learner has it.
+#    Fix:   Either wait for it to free, OR run bootstrap with `--skip-endpoint`
+#           and proceed without predict Lambda functioning. Dashboard tolerates.
+#
+# 6. `Lambda accelya-dlq-replayer-<learner> → MISSING` (Day-10 pre-flight)
+#    Cause: Day-5 starter-repo handler was never deployed before Day 10.
+#    Fix:   bootstrap_day10.sh STAGE 7 deploys it. If the script is older,
+#           run `bash trainer-deliverables/52_deploy_dlq_replayer.sh <learner>`.
+#
+# 7. `cannot publish to SNS topic` (Cost Anomaly Detection)
+#    Cause: SNS topic policy doesn't allow `costalerts.amazonaws.com` to publish.
+#    Fix:   Patch the SNS topic Policy attribute with a statement allowing
+#           Principal.Service=costalerts.amazonaws.com on sns:Publish.
+#
+# 8. `NumberOfPolicyVersions limit exceeded` (IAM)
+#    Cause: 5-version cap on customer-managed policy.
+#    Fix:   Prune oldest non-default version, THEN create-policy-version.
+#
+# 9. IAM eventual consistency (any "permission denied" right after a role
+#    change or policy update)
+#    Cause: IAM updates propagate over 10-30s globally.
+#    Fix:   `sleep 15` after IAM mutations, then retry the failing operation.
+
+## ASL CHUNK CONTEXT
+# (unchanged from v2)
+
+## SQS PARTIAL-BATCH CONTEXT
+# (unchanged from v2)
+
+## STREAM CONTEXT
+# (unchanged from v4)
+
+## STATE CONTEXT
+# (unchanged from v5)
+
+## MODEL CONTEXT
+# (unchanged from v6)
+
+## OBSERVABILITY CONTEXT
+# Use this block when Cascade scaffolds ANY Lambda or modifies the ASL.
+# Applies from Day 10 forward. Three pillars + cost as 4th unofficial pillar.
+
+- powertools versions (PIN — do NOT upgrade without trainer approval):
+    aws-lambda-powertools[tracer]==2.43.1
+- Required helpers (ALWAYS via src/common/observability.py — NEVER hand-roll):
+    from common.observability import (
+        get_logger, get_metrics, get_tracer,
+        get_correlation_id, flush_metrics_early,
+    )
+
+- Correlation ID contract (MANDATORY chain — use get_correlation_id helper):
+    Precedence:
+      1. envelope['correlation_id']
+      2. envelope.get('envelope', {}).get('correlation_id')
+      3. envelope.get('event_id')                 # Day-7 PK
+      4. f'corr-{uuid4()}'                        # fresh fallback
+    NEVER call uuid.uuid4() inside the handler — use the helper.
+
+- powertools Logger contract:
+    @logger.inject_lambda_context(correlation_id_path='correlation_id', log_event=False)
+    def handler(event, context): ...
+    # log_event=False to avoid PII leakage; logs the structured fields you add explicitly.
+
+- EMF metric namespace: Accelya/Pipeline
+- EMF service dimension: powertools auto-adds 'service' from Metrics(service=...)
+- EMF dimensions (max 3 per metric — CW cost spikes after that):
+    auto:        service
+    common:      model_version (when present), source_system (when present)
+- Per-Lambda standard metrics (every handler emits at least these):
+    RecordsOk         Count          (records successfully processed)
+    RecordsErr        Count          (records failed)
+    Duration          Milliseconds   (handler wall-clock)
+- Per-component additional metrics:
+    bedrock_enrich:    InputTokenCount, OutputTokenCount, CostPerRecordEstimate
+    predict:           ModelLatency, ColdStart (0|1), CostPerRecordEstimate, HourlyConfidenceMean
+    consumer:          KinesisRecordsClaimed, SFNStartExecutionLatency
+    persist_enriched:  EnrichedBytesWritten, EnrichedRecordsWritten
+- Flush-early rule (timeout-risk paths — MANDATORY):
+    metrics.flush_metrics()  BEFORE invoke_endpoint()
+    metrics.flush_metrics()  BEFORE bedrock-runtime.invoke_model()
+    Reason: Lambda hard-timeout kills the decorator's exit emit → metric lost.
+
+- X-Ray tracing — all 10 Lambdas + state machine:
+    Lambda TracingConfig:  Mode=Active   (set via update-function-configuration)
+    Tracer decorator:      @tracer.capture_lambda_handler
+    State machine:         tracingConfiguration={enabled:true}
+- X-Ray trace header propagation MANDATORY:
+    consumer/handler.py BEFORE sfn.start_execution:
+        trace_header = os.environ.get('_X_AMZN_TRACE_ID')
+    sfn.start_execution(
+        stateMachineArn=...,
+        name=f'enrich-{correlation_id}',
+        input=...,
+        traceHeader=trace_header,            # ← non-optional from D10 onward
+    )
+
+- CloudWatch Logs:
+    Retention: 14 days on every /aws/lambda/accelya-* log group
+    Set via: aws logs put-retention-policy --retention-in-days 14
+    NEVER leave a log group at 'Never Expire' in production code.
+
+- Alarm thresholds (when authoring infra/alarms-*.json):
+    iterator-age-<learner>:
+        Metric:         GetRecords.IteratorAgeMilliseconds (AWS/Kinesis)
+        Stat:           Maximum
+        Period:         60s
+        Eval/Datapts:   5 / 5
+        Threshold:      60000  (60s — 1 batch behind)
+        TreatMissing:   notBreaching
+    bedrock-throttle-<learner>:
+        Metric:         InvocationThrottles (AWS/Bedrock)
+        Dimension:      ModelId
+        Stat:           Sum
+        Period:         300s
+        Eval/Datapts:   1 / 1
+        Threshold:      5
+    confidence-drift-<learner>:
+        Form:           ANOMALY_DETECTION_BAND (2-sigma)
+        Metrics:
+            m_curr  = HourlyConfidenceMean (Accelya/Pipeline) period=3600 Avg
+            ad1     = ANOMALY_DETECTION_BAND(m_curr, 2)
+        ThresholdMetricId: ad1
+        ComparisonOp:   LessThanLowerOrGreaterThanUpperThreshold
+        Eval/Datapts:   1 / 1 hr
+        TreatMissing:   notBreaching
+        NOTE: A hand-rolled "compare to prior hour" math expression is NOT
+        supported by put-metric-alarm — the `Offset` parameter exists only
+        in the CW console, not the API (Unknown parameter in Metrics[N]:
+        Offset). ANOMALY_DETECTION_BAND is the supported equivalent and
+        auto-baselines + implicitly count-guards.
+
+- Cost monitor (NOT a CW alarm — different surface):
+    Service:    AWS Cost Anomaly Detection
+    Region:     us-east-1 (global service)
+    Scope:      tag programme=accelya
+    Threshold:  $10
+    Lag:        8-24h (acceptable; not real-time)
+    Subscribe:  SNS topic accelya-alarms-<learner> in ap-south-1 (cross-region OK)
+
+- Cost-per-record EMF formula (CostPerRecordEstimate metric):
+    bedrock_cost = (input_tokens + output_tokens) × 0.003 / 1000
+    lambda_cost  = (duration_ms / 1000) × (memory_mb / 1024) × 0.0000166667
+    total        = bedrock_cost + lambda_cost
+    Emit on bedrock_enrich AND predict handlers.
+
+- Tagging contract (every AWS resource):
+    programme=accelya
+    owner=<learner>
+    environment=lab
+    NB: tagging CLI syntax differs by service — see helper:
+        scripts/tag_module10_resources.sh
+
+- Sampling rule (X-Ray, lab override):
+    Rule name:     accelya-lab-trace-all-<learner>
+    FixedRate:     1.0  (trace 100% during lab)
+    Priority:      1
+    Reservoir:     1
+    Cleanup:       MUST delete at end of Lab 1 — back to Default (5%)
+
+- Forbidden patterns:
+    - boto3 cloudwatch.put_metric_data() in hot path  (use EMF via powertools)
+    - Generating new uuid for correlation_id outside producer
+    - Skipping traceHeader= on sfn.start_execution
+    - Leaving log groups at 'Never Expire'
+    - Wildcard Resource in IAM policy after Lab 3
+    - Wildcard Action on write/modify verbs
+    - put_metric_data calls inside per-record loops
+    - Manual `logging.getLogger('app')` — use get_logger() helper
+
+- IAM tightening (post Lab 3):
+    accelya-pipeline-policy version-5 cap:
+        Before create-policy-version, capture PREV; prune oldest if at 5/5.
+    IAM eventual consistency:
+        sleep 15 after set-as-default before canary.
+    Auto-rollback rule:
+        Canary execution must reach SUCCEEDED within 60s
+        OR set-default-policy-version back to PREV.
+
+- Access Analyzer gate split (CI integration in Day 11):
+    ERROR or SECURITY_WARNING → BLOCK (exit 1; MR cannot merge)
+    GENERAL_WARNING or SUGGESTION → COMMIT findings to MR for human review
+    NEVER auto-block all four; NEVER auto-allow all four.
+
+## CATALOG CONTEXT
+# (unchanged from v3)
+
+## EXAMPLES
+- Cancellation envelope: see v4 EXAMPLES
+- Settlement record: see v3 EXAMPLES
+- Stream idempotency: see v4 EXAMPLES
+- SageMaker invoke payload: see v6 EXAMPLES
+- Standard powertools handler skeleton (Day 10 — every Lambda):
+    from common.observability import (
+        get_logger, get_metrics, get_tracer,
+        get_correlation_id, flush_metrics_early,
+    )
+    from aws_lambda_powertools.metrics import MetricUnit
+
+    logger  = get_logger(service='bedrock-enrich')
+    metrics = get_metrics(service='bedrock-enrich')
+    tracer  = get_tracer(service='bedrock-enrich')
+
+    @tracer.capture_lambda_handler
+    @logger.inject_lambda_context(correlation_id_path='correlation_id', log_event=False)
+    @metrics.log_metrics
+    def handler(event, context):
+        corr = get_correlation_id(event)
+        logger.set_correlation_id(corr)
+        metrics.add_metric(name='RecordsOk', unit=MetricUnit.Count, value=0)
+        try:
+            # ... business logic ...
+            flush_metrics_early(metrics)        # before risky call
+            result = invoke_bedrock(...)
+            metrics.add_metric(name='RecordsOk', unit=MetricUnit.Count, value=1)
+            return result
+        except Exception:
+            metrics.add_metric(name='RecordsErr', unit=MetricUnit.Count, value=1)
+            raise
+
+## REVIEW
+- 8-dim HITL checklist (Observability + Cost bars rose in v7; no NEW dim):
+    Correctness · Safety · Idempotency · Observability · Cost ·
+    Schema Discipline (D6) · Per-PK Ordering (D7) · Confidence Handling (D9)
+- HITL_REVIEW-<artefact>.md committed; PASS at >=19/24 AND every dim >=2/3
+- Observability sub-checks (v7 — bar raised; 0-3 score):
+    1. correlation_id propagated end-to-end                       (must be present)
+    2. EMF metric emitted with service dimension                  (must be present)
+    3. X-Ray subsegment annotated                                  (auto via tracer decorator)
+    4. Log retention set on the Lambda's log group                (verify with describe-log-groups)
+    For score 3: ALL four present.
+    For score 2: 3/4 present.
+    For score 1: 1-2/4 present.
+    For score 0: none of the above (auto-fail dim).
+- Cost sub-checks (v7 — bar raised):
+    1. CostPerRecordEstimate EMF emitted (bedrock_enrich + predict)
+    2. AWS Cost Anomaly Detection monitor wired
+    3. Every resource tagged programme=accelya
+    For score 3: ALL three present.
+- 13-layer prompt (NEW): prompts/v13_observability.txt includes OBSERVABILITY CONTEXT slot
+- IAM:
+    NO wildcard Resource on write/modify verbs.
+    NO wildcard Action on write/modify verbs.
+    Read-only verbs (e.g. `Describe*`, `List*`) MAY use wildcards when scoped.
+- Region: every CLI uses --region ap-south-1.
+    EXCEPTION: AWS Cost Explorer / Cost Anomaly Detection — --region us-east-1
+- Synthetic data only.

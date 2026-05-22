@@ -1,0 +1,143 @@
+{
+  "_comment": "accelya-pipeline-policy (Lambda execution role). Day-10 Lab-3 tightened version. Replace <learner> and <account> before applying. Two-role pattern: this is the Lambda role; the Step Functions role gets its own scoped policy + the AWSXRayDaemonWriteAccess managed policy + an inline policy for xray:GetSamplingRules and xray:GetSamplingTargets (NOT in the managed policy).",
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "S3Data",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::accelya-airline-data-ap-south-1/raw/<learner>/*",
+        "arn:aws:s3:::accelya-airline-data-ap-south-1/curated/<learner>/*",
+        "arn:aws:s3:::accelya-airline-data-ap-south-1/review/<learner>/*",
+        "arn:aws:s3:::accelya-airline-data-ap-south-1/enriched/<learner>/*",
+        "arn:aws:s3:::accelya-airline-data-ap-south-1/quarantine/<learner>/*"
+      ]
+    },
+    {
+      "Sid": "S3ListBucket",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::accelya-airline-data-ap-south-1",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "raw/<learner>/*",
+            "curated/<learner>/*",
+            "review/<learner>/*",
+            "enriched/<learner>/*",
+            "quarantine/<learner>/*"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "DynamoDB",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:PutItem",
+        "dynamodb:GetItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:Query"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:ap-south-1:<account>:table/stream_seen_keys_<learner>",
+        "arn:aws:dynamodb:ap-south-1:<account>:table/idempotency_<learner>"
+      ]
+    },
+    {
+      "Sid": "BedrockInvoke",
+      "Effect": "Allow",
+      "Action": ["bedrock:InvokeModel"],
+      "Resource": [
+        "arn:aws:bedrock:ap-south-1::foundation-model/anthropic.claude-3-5-sonnet-20241022-v2:0",
+        "arn:aws:bedrock:ap-south-1:<account>:inference-profile/apac.anthropic.claude-3-5-sonnet-20241022-v2:0"
+      ]
+    },
+    {
+      "Sid": "SageMakerRuntime",
+      "Effect": "Allow",
+      "Action": ["sagemaker:InvokeEndpoint"],
+      "Resource": "arn:aws:sagemaker:ap-south-1:<account>:endpoint/accelya-cancel-risk-<learner>"
+    },
+    {
+      "Sid": "SQSReadWrite",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:SendMessage",
+        "sqs:ReceiveMessage",
+        "sqs:DeleteMessage",
+        "sqs:GetQueueAttributes"
+      ],
+      "Resource": [
+        "arn:aws:sqs:ap-south-1:<account>:model-review-queue-<learner>",
+        "arn:aws:sqs:ap-south-1:<account>:cancellation-events-dlq-<learner>"
+      ]
+    },
+    {
+      "Sid": "KinesisRead",
+      "Effect": "Allow",
+      "Action": [
+        "kinesis:GetRecords",
+        "kinesis:GetShardIterator",
+        "kinesis:DescribeStream",
+        "kinesis:DescribeStreamSummary",
+        "kinesis:ListShards"
+      ],
+      "Resource": "arn:aws:kinesis:ap-south-1:<account>:stream/cancellation-events-<learner>"
+    },
+    {
+      "Sid": "KinesisWrite",
+      "Effect": "Allow",
+      "Action": [
+        "kinesis:PutRecord",
+        "kinesis:PutRecords"
+      ],
+      "Resource": "arn:aws:kinesis:ap-south-1:<account>:stream/cancellation-events-<learner>"
+    },
+    {
+      "Sid": "StepFunctionsStart",
+      "Effect": "Allow",
+      "Action": ["states:StartExecution"],
+      "Resource": "arn:aws:states:ap-south-1:<account>:stateMachine:inference-pipeline-<learner>"
+    },
+    {
+      "Sid": "CloudWatchLogs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:ap-south-1:<account>:log-group:/aws/lambda/accelya-*:*"
+    },
+    {
+      "Sid": "XRayWrite",
+      "Effect": "Allow",
+      "Action": [
+        "xray:PutTraceSegments",
+        "xray:PutTelemetryRecords",
+        "xray:GetSamplingRules",
+        "xray:GetSamplingTargets"
+      ],
+      "Resource": "*",
+      "_xray_wildcard_justification": "X-Ray write actions cannot be ARN-scoped — the API doesn't expose resource-level permissions for trace segments. Access Analyzer will not flag this as SECURITY_WARNING because xray:* is recognised as resource-agnostic at the service level."
+    },
+    {
+      "Sid": "CloudWatchMetricsEMF",
+      "Effect": "Allow",
+      "Action": ["cloudwatch:PutMetricData"],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "cloudwatch:namespace": ["Accelya/Pipeline"]
+        }
+      },
+      "_emf_note": "EMF writes go via CloudWatch Logs (already covered by CloudWatchLogs Sid), so this is unused by our hot path; included for any boto3 fallback. Conditioned on namespace to scope tightly."
+    }
+  ]
+}

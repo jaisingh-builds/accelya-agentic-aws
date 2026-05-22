@@ -1,0 +1,160 @@
+# prompts/v13_observability.txt — Day 10 13-layer prompt
+#
+# Use this as the SYSTEM prompt to Cascade when scaffolding any Day-10
+# artefact (observability helper, dashboard JSON, alarm JSON, IAM diff).
+#
+# Layers (in reading order):
+#   1.  REPO RULES
+#   2.  CONSTRAINTS
+#   3.  ASL CHUNK CONTEXT          (D2+)
+#   4.  SQS PARTIAL-BATCH CONTEXT  (D2+)
+#   5.  STREAM CONTEXT             (D7+)
+#   6.  STATE CONTEXT              (D8+)
+#   7.  MODEL CONTEXT              (D9+)
+#   8.  OBSERVABILITY CONTEXT      (D10+ — NEW)
+#   9.  CATALOG CONTEXT            (D6+)
+#   10. EXAMPLES
+#   11. REVIEW
+#   12. TASK
+#   13. OUTPUT FORMAT
+
+# ──────────────────────────────────────────────────────────────────────────
+# LAYERS 1-7: Cascade is expected to have these via .windsurfrules v7.
+# This prompt file SUPPLEMENTS — it doesn't re-state — those layers.
+# Cascade reads .windsurfrules first; this file is the per-task overlay.
+# ──────────────────────────────────────────────────────────────────────────
+
+## LAYER 8 — OBSERVABILITY CONTEXT (per-task overlay)
+
+You are scaffolding code for the Day-10 observability pass. The 10 Lambdas
+already exist (Days 5-9). You're adding instrumentation, NOT new business
+logic. Reject any prompt that requests new Lambda creation today.
+
+Authoring rules:
+
+1. ALWAYS use src/common/observability.py — never hand-roll Logger /
+   Metrics / Tracer instantiation. The 4 helpers — get_logger,
+   get_metrics, get_tracer, get_correlation_id — are the only correct
+   way to bring observability into a handler.
+
+2. ALWAYS chain all three decorators on the handler:
+       @tracer.capture_lambda_handler
+       @logger.inject_lambda_context(correlation_id_path='correlation_id',
+                                     log_event=False)
+       @metrics.log_metrics
+       def handler(event, context): ...
+   Order matters: tracer outermost, logger middle, metrics innermost
+   (innermost runs last, so metrics emit AFTER logs are correlated).
+
+3. CALL get_correlation_id(event) once at handler entry, then
+   logger.set_correlation_id(corr_id). DO NOT call uuid.uuid4() in any
+   non-producer handler.
+
+4. EMIT three standard metrics minimum:
+       RecordsOk    (MetricUnit.Count)
+       RecordsErr   (MetricUnit.Count)
+       Duration     (MetricUnit.Milliseconds)
+   Plus the component-specific metrics from .windsurfrules OBSERVABILITY
+   CONTEXT block (bedrock_enrich: tokens + cost; predict: latency + cold
+   + confidence + cost).
+
+5. CALL flush_metrics_early(metrics) BEFORE any operation that might
+   time out the Lambda — invoke_endpoint, invoke_model, large S3 read.
+   This guarantees CW gets the in-flight metrics even on hard timeout.
+
+6. NEVER use boto3.client('cloudwatch').put_metric_data(...) in a hot
+   path. EMF via powertools is the only acceptable per-record emit.
+
+7. For Lambda code that calls Step Functions, the start_execution call
+   MUST include the traceHeader argument:
+       trace_header = os.environ.get('_X_AMZN_TRACE_ID')
+       sfn.start_execution(..., traceHeader=trace_header)
+   Skipping it disconnects the X-Ray service map.
+
+## LAYER 9 — CATALOG CONTEXT
+# (unchanged from v3 — see .windsurfrules)
+
+## LAYER 10 — EXAMPLES
+
+Standard handler skeleton (copy/adapt for any Lambda you're instrumenting):
+
+    """
+    src/<component>/handler.py — Day-10-instrumented Lambda.
+    """
+    import os
+    from common.observability import (
+        get_logger, get_metrics, get_tracer,
+        get_correlation_id, flush_metrics_early, MetricUnit,
+    )
+
+    logger  = get_logger(service='<component>')
+    metrics = get_metrics(service='<component>')
+    tracer  = get_tracer(service='<component>')
+
+    @tracer.capture_lambda_handler
+    @logger.inject_lambda_context(correlation_id_path='correlation_id',
+                                  log_event=False)
+    @metrics.log_metrics
+    def handler(event, context):
+        corr = get_correlation_id(event)
+        logger.set_correlation_id(corr)
+        logger.info('handler entry', extra={'event_keys': list(event.keys())})
+
+        try:
+            # business logic
+            flush_metrics_early(metrics)        # before risky call
+            result = _do_work(event)
+            metrics.add_metric(name='RecordsOk', unit=MetricUnit.Count, value=1)
+            return result
+        except Exception as e:
+            metrics.add_metric(name='RecordsErr', unit=MetricUnit.Count, value=1)
+            logger.error('handler error', extra={'error_type': type(e).__name__})
+            raise
+
+For consumer Lambda (the one that calls sfn.start_execution), add:
+
+    sfn = boto3.client('stepfunctions')
+
+    def _start_enrichment(envelope: dict, corr_id: str) -> None:
+        trace_header = os.environ.get('_X_AMZN_TRACE_ID', '')
+        sfn.start_execution(
+            stateMachineArn=os.environ['STATE_MACHINE_ARN'],
+            name=f"enrich-{corr_id}",
+            input=json.dumps(envelope),
+            traceHeader=trace_header,           # ← MANDATORY
+        )
+
+For predict Lambda's CostPerRecordEstimate metric:
+
+    bedrock_cost = (input_tokens + output_tokens) * 0.003 / 1000  # n/a for predict
+    duration_s   = result['model_latency_ms'] / 1000
+    memory_gb    = int(os.environ['AWS_LAMBDA_FUNCTION_MEMORY_SIZE']) / 1024
+    lambda_cost  = duration_s * memory_gb * 0.0000166667
+    metrics.add_metric(name='CostPerRecordEstimate',
+                       unit=MetricUnit.None_,
+                       value=round(bedrock_cost + lambda_cost, 6))
+    metrics.add_metric(name='HourlyConfidenceMean',
+                       unit=MetricUnit.None_,
+                       value=result['confidence'])
+
+## LAYER 11 — REVIEW
+
+When the artefact is ready, score against the 8-dim HITL rubric. v7 raises
+the Observability and Cost bars (see .windsurfrules REVIEW section):
+
+- Observability ≥ 2 requires: correlation_id propagated + EMF metric
+  with service dimension + X-Ray subsegment + log retention set.
+- Cost ≥ 2 requires: CostPerRecordEstimate EMF + Cost Anomaly Detection
+  monitor wired + every resource tagged programme=accelya.
+
+Score 0 in either Observability or Cost → auto-fail HITL (was a warning
+in v6; v7 promotes to fail).
+
+## LAYER 12 — TASK
+{user_prompt}
+
+## LAYER 13 — OUTPUT FORMAT
+- File path(s) and contents in fenced code blocks
+- One paragraph explaining the trade-off chosen
+- Any HITL warnings ("score 1 on Observability because...")
+- NO speculation about "what else we could add later" — out of scope for v7

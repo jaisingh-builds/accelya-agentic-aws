@@ -1,0 +1,117 @@
+{
+  "_comment": "3 CW alarms + 1 Cost Anomaly Detection monitor reference. The trainer deploy script 51_create_m10_observability.sh creates these via individual `aws cloudwatch put-metric-alarm` calls (CW doesn't accept a bulk JSON). This file is the canonical spec to diff against if anything drifts.",
+  "_sns_topic_required": "arn:aws:sns:ap-south-1:<account>:accelya-alarms-<learner>",
+
+  "alarms": [
+    {
+      "AlarmName": "iterator-age-<learner>",
+      "AlarmDescription": "Kinesis consumer is falling behind: iterator age > 60s for 5/5 min. Likely cause: consumer Lambda throttled, ESM batch_size too small, or downstream SFN throttled.",
+      "MetricName": "GetRecords.IteratorAgeMilliseconds",
+      "Namespace": "AWS/Kinesis",
+      "Dimensions": [
+        {"Name": "StreamName", "Value": "cancellation-events-<learner>"}
+      ],
+      "Statistic": "Maximum",
+      "Period": 60,
+      "EvaluationPeriods": 5,
+      "DatapointsToAlarm": 5,
+      "Threshold": 60000,
+      "ComparisonOperator": "GreaterThanThreshold",
+      "TreatMissingData": "notBreaching",
+      "AlarmActions": ["<SNS_TOPIC_ARN>"],
+      "OKActions": ["<SNS_TOPIC_ARN>"]
+    },
+
+    {
+      "AlarmName": "bedrock-throttle-<learner>",
+      "AlarmDescription": "Bedrock InvocationThrottles > 5 in 5 min — quota pressure. Action: lower SAMPLE_RATE in accelya-bedrock-enrich-<learner> from 10 to 5, or request quota increase.",
+      "MetricName": "InvocationThrottles",
+      "Namespace": "AWS/Bedrock",
+      "Dimensions": [
+        {"Name": "ModelId", "Value": "apac.anthropic.claude-3-5-sonnet-20241022-v2:0"}
+      ],
+      "Statistic": "Sum",
+      "Period": 300,
+      "EvaluationPeriods": 1,
+      "DatapointsToAlarm": 1,
+      "Threshold": 5,
+      "ComparisonOperator": "GreaterThanThreshold",
+      "TreatMissingData": "notBreaching",
+      "AlarmActions": ["<SNS_TOPIC_ARN>"]
+    },
+
+    {
+      "AlarmName": "confidence-drift-<learner>",
+      "AlarmDescription": "predict HourlyConfidenceMean outside ANOMALY_DETECTION_BAND (2-sigma). Auto-baseline; tightens over ~2 weeks. Likely cause when it fires: model decay, input distribution shift, or upstream data-quality issue.",
+      "_why_anomaly_detection": "CloudWatch put-metric-alarm rejects the Offset parameter on metric stats — that's console-only. The supported AWS way to alarm on 'current value statistically different from baseline' is the ANOMALY_DETECTION_BAND math function. Bonus: it count-guards implicitly (no data → notBreaching), tightens its band over time, and is cheaper to author than a hand-rolled m_prev/m_curr expression.",
+      "Metrics": [
+        {
+          "Id": "m_curr",
+          "Label": "HourlyConfidenceMean",
+          "ReturnData": true,
+          "MetricStat": {
+            "Metric": {
+              "Namespace": "Accelya/Pipeline",
+              "MetricName": "HourlyConfidenceMean",
+              "Dimensions": [
+                {"Name": "service", "Value": "predict-cancel-risk"}
+              ]
+            },
+            "Period": 3600,
+            "Stat": "Average"
+          }
+        },
+        {
+          "Id": "ad1",
+          "Label": "ConfidenceMean (ExpectedRange)",
+          "Expression": "ANOMALY_DETECTION_BAND(m_curr, 2)",
+          "ReturnData": true
+        }
+      ],
+      "ThresholdMetricId": "ad1",
+      "ComparisonOperator": "LessThanLowerOrGreaterThanUpperThreshold",
+      "EvaluationPeriods": 1,
+      "DatapointsToAlarm": 1,
+      "TreatMissingData": "notBreaching",
+      "AlarmActions": ["<SNS_TOPIC_ARN>"]
+    }
+  ],
+
+  "cost_anomaly_monitor": {
+    "_comment": "AWS Cost Anomaly Detection is a global service, hit via --region us-east-1. The SNS subscription can target ap-south-1 (cross-region OK). Lag 8-24h; not a real-time alarm.",
+    "_region": "us-east-1",
+    "MonitorName": "accelya-cost-monitor-<learner>",
+    "MonitorType": "DIMENSIONAL",
+    "MonitorDimension": "SERVICE",
+    "MonitorSpecification": {
+      "Tags": {
+        "Key": "programme",
+        "Values": ["accelya"],
+        "MatchOptions": ["EQUALS"]
+      }
+    }
+  },
+
+  "cost_anomaly_subscription": {
+    "_region": "us-east-1",
+    "_frequency_note": "SNS subscribers require IMMEDIATE frequency. DAILY/WEEKLY are Email-only (returns ValidationException: 'Daily or weekly frequencies only support Email subscriptions'). Cross-region SNS still works fine in IMMEDIATE mode.",
+    "_threshold_note": "Use ThresholdExpression (2023+); top-level `Threshold` is deprecated and rejected for new subscriptions.",
+    "SubscriptionName": "accelya-cost-alerts-<learner>",
+    "ThresholdExpression": {
+      "Dimensions": {
+        "Key": "ANOMALY_TOTAL_IMPACT_ABSOLUTE",
+        "Values": ["10"],
+        "MatchOptions": ["GREATER_THAN_OR_EQUAL"]
+      }
+    },
+    "Frequency": "IMMEDIATE",
+    "MonitorArnList": ["<COST_MONITOR_ARN>"],
+    "Subscribers": [
+      {
+        "Type": "SNS",
+        "Address": "<SNS_TOPIC_ARN>",
+        "Status": "CONFIRMED"
+      }
+    ]
+  }
+}
