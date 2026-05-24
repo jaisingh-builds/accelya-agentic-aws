@@ -74,10 +74,24 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '${{ env.PYTHON_VERSION }}' }
-      - run: pip install --quiet cfn-lint
-      # W3005 suppressed — DependsOn on LogGroup is intentional belt-and-braces
-      # to prevent Lambda runtime racing CFN-managed log group creation.
-      - run: cfn-lint --ignore-checks W3005 infra/template-*.yaml
+      # Pin cfn-lint to a known-good version; the 1.5x series changed how
+      # SAM Transform templates are loaded. v1.32 handles `Transform: AWS::Serverless-*`
+      # without trying to validate the post-expansion CFN (which it can't,
+      # without running the macro server-side).
+      - run: pip install --quiet 'cfn-lint==1.32.4'
+      # Suppressions:
+      #   W3005 — DependsOn on LogGroup is intentional belt-and-braces
+      #           (prevents Lambda runtime racing CFN-managed log group creation)
+      #   E1001 — false-positive on SAM templates: cfn-lint can't pre-expand the
+      #           Transform macro, occasionally fails to find `Resources:` at the
+      #           pre-transform stage. `sam validate` (run in deploy-sandbox) is
+      #           the authoritative check; cfn-lint is for schema sanity.
+      # Invoke per-file so the failure message names the offending template
+      # instead of `None:1:1` from glob-expansion ambiguity.
+      - name: cfn-lint foundation
+        run: cfn-lint --ignore-checks W3005 infra/template-foundation.yaml
+      - name: cfn-lint app
+        run: cfn-lint --ignore-checks W3005 E1001 infra/template-app.yaml
 
   cfn-nag:
     name: Lint · cfn-nag (CFN security patterns)
@@ -100,7 +114,10 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: gh-${{ github.run_id }}-preflight
       - run: aws sts get-caller-identity      # sanity check
-      - run: bash scripts/preflight-lambda-cap.sh "pr-${{ github.event.pull_request.number || 'main' }}"
+      - name: Run preflight Lambda cap guard
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number || 'main' }}
+        run: bash scripts/preflight-lambda-cap.sh "pr-${PR_NUMBER}"
 
   # ────────────────────────────────────────────────────────────────────────
   # TEST — pytest, parallel with lint
@@ -153,21 +170,25 @@ jobs:
         run: sam build -t infra/template-app.yaml
 
       - name: SAM deploy
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           sam deploy \
             --template-file .aws-sam/build/template.yaml \
-            --stack-name accelya-app-pr-${{ github.event.pull_request.number }} \
+            --stack-name "accelya-app-pr-${PR_NUMBER}" \
             --resolve-s3 \
             --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
-            --parameter-overrides Learner=pr-${{ github.event.pull_request.number }} \
+            --parameter-overrides "Learner=pr-${PR_NUMBER}" \
             --no-confirm-changeset \
             --no-fail-on-empty-changeset \
-            --tags programme=accelya pr=${{ github.event.pull_request.number }} environment=sandbox
+            --tags programme=accelya "pr=${PR_NUMBER}" environment=sandbox
 
       - name: Capture stack outputs
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           aws cloudformation describe-stacks \
-            --stack-name accelya-app-pr-${{ github.event.pull_request.number }} \
+            --stack-name "accelya-app-pr-${PR_NUMBER}" \
             --query 'Stacks[0].Outputs' \
             --output table
 
@@ -193,7 +214,9 @@ jobs:
           role-session-name: gh-${{ github.run_id }}-itest
 
       - name: Run integration test
-        run: python3 tests/integration_test.py --learner pr-${{ github.event.pull_request.number }} --region ${{ env.AWS_REGION }}
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: python3 tests/integration_test.py --learner "pr-${PR_NUMBER}" --region "$AWS_REGION"
 
       - if: always()
         uses: actions/upload-artifact@v4

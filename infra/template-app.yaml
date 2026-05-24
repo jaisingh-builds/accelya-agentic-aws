@@ -2,7 +2,7 @@ AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >
   Accelya APP stack — ephemeral compute + observability.
-  Deployed per MR by GitLab CI (stack name accelya-app-<branch-slug>).
+  Deployed per PR by GitHub Actions (stack name accelya-app-pr-<number>).
   References foundation stack via !ImportValue.
   Every Lambda has AutoPublishAlias + DeploymentPreference + Alarms.
 

@@ -71,8 +71,14 @@ def _required_env(name: str) -> str:
 
 
 def _bucket_hash(s: str) -> int:
-    """Stable hash for PNR → 0..7 bucket."""
-    return int(hashlib.md5(s.encode()).hexdigest(), 16)
+    """Stable hash for PNR → 0..7 bucket.
+
+    MD5 here is a PARTITIONING HASH for Kinesis bucket selection, not security.
+    Deterministic PNR → bucket mapping preserves per-PNR ordering on shard
+    placement; cryptographic strength is irrelevant. `usedforsecurity=False`
+    (Python 3.9+) signals intent so bandit B324 doesn't flag.
+    """
+    return int(hashlib.md5(s.encode(), usedforsecurity=False).hexdigest(), 16)
 
 
 def _partition_key(event: dict[str, Any]) -> str:
