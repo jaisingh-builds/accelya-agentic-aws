@@ -1,0 +1,178 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Accelya FOUNDATION stack — stateful resources with Retain policy.
+  Deployed ONCE per learner by the trainer or via /day11-bootstrap.
+  Never deleted by MR pipelines. Outputs imported by app stack.
+
+Parameters:
+  Learner:
+    Type: String
+    Description: Lowercase learner suffix (a-z0-9-, starts with letter)
+    AllowedPattern: '^[a-z][a-z0-9-]*$'
+
+  Bucket:
+    Type: String
+    Default: accelya-airline-data-ap-south-1
+    Description: Shared S3 bucket (trainer-provisioned)
+
+# ──────────────────────────────────────────────────────────────────────────
+# Resources — every one carries DeletionPolicy + UpdateReplacePolicy = Retain
+# ──────────────────────────────────────────────────────────────────────────
+Resources:
+  # ── Kinesis ingestion stream ──────────────────────────────────────────
+  CancellationEventsStream:
+    Type: AWS::Kinesis::Stream
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: !Sub cancellation-events-${Learner}
+      ShardCount: 2
+      RetentionPeriodHours: 24
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+      Tags:
+        - { Key: programme,   Value: accelya }
+        - { Key: owner,       Value: !Ref Learner }
+        - { Key: environment, Value: lab }
+
+  # ── DDB idempotency table ─────────────────────────────────────────────
+  StreamSeenKeysTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub stream_seen_keys_${Learner}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: event_id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: event_id, KeyType: HASH }
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - { Key: programme,   Value: accelya }
+        - { Key: owner,       Value: !Ref Learner }
+
+  # ── DLQ for stream consumer failures ─────────────────────────────────
+  StreamDlq:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      QueueName: !Sub stream-dlq-${Learner}
+      MessageRetentionPeriod: 1209600   # 14 days (max)
+      VisibilityTimeout: 60
+      Tags:
+        - { Key: programme,   Value: accelya }
+        - { Key: owner,       Value: !Ref Learner }
+
+  # ── Low-confidence review queue (Day-9 output) ───────────────────────
+  ModelReviewQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      QueueName: !Sub model-review-queue-${Learner}
+      MessageRetentionPeriod: 1209600
+      VisibilityTimeout: 60
+      Tags:
+        - { Key: programme,   Value: accelya }
+        - { Key: owner,       Value: !Ref Learner }
+
+  # ── DLQ-replayer escalation topic ────────────────────────────────────
+  EscalationTopic:
+    Type: AWS::SNS::Topic
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TopicName: !Sub accelya-dlq-escalation-${Learner}
+      Tags:
+        - { Key: programme,   Value: accelya }
+        - { Key: owner,       Value: !Ref Learner }
+
+  # ── Day-10 alarms SNS topic ──────────────────────────────────────────
+  AlarmsTopic:
+    Type: AWS::SNS::Topic
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TopicName: !Sub accelya-alarms-${Learner}
+      Tags:
+        - { Key: programme,   Value: accelya }
+        - { Key: owner,       Value: !Ref Learner }
+
+  # ── SNS topic policy — allow Cost Anomaly Detection to publish ───────
+  AlarmsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AlarmsTopic]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCostAnomalyDetectionPublish
+            Effect: Allow
+            Principal:
+              Service: costalerts.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref AlarmsTopic
+          - Sid: AllowAccountSelfPublish
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: sns:Publish
+            Resource: !Ref AlarmsTopic
+
+# ──────────────────────────────────────────────────────────────────────────
+# Outputs — imported by the app stack via !ImportValue
+# ──────────────────────────────────────────────────────────────────────────
+Outputs:
+  StreamArn:
+    Value: !GetAtt CancellationEventsStream.Arn
+    Export:
+      Name: !Sub accelya-foundation-${Learner}-StreamArn
+
+  StreamName:
+    Value: !Ref CancellationEventsStream
+    Export:
+      Name: !Sub accelya-foundation-${Learner}-StreamName
+
+  StreamSeenKeysTableArn:
+    Value: !GetAtt StreamSeenKeysTable.Arn
+    Export:
+      Name: !Sub accelya-foundation-${Learner}-DDBArn
+
+  StreamSeenKeysTableName:
+    Value: !Ref StreamSeenKeysTable
+    Export:
+      Name: !Sub accelya-foundation-${Learner}-DDBName
+
+  StreamDlqArn:
+    Value: !GetAtt StreamDlq.Arn
+    Export:
+      Name: !Sub accelya-foundation-${Learner}-DlqArn
+
+  StreamDlqUrl:
+    Value: !Ref StreamDlq
+    Export:
+      Name: !Sub accelya-foundation-${Learner}-DlqUrl
+
+  ModelReviewQueueUrl:
+    Value: !Ref ModelReviewQueue
+    Export:
+      Name: !Sub accelya-foundation-${Learner}-ReviewQueueUrl
+
+  EscalationTopicArn:
+    Value: !Ref EscalationTopic
+    Export:
+      Name: !Sub accelya-foundation-${Learner}-EscalationTopicArn
+
+  AlarmsTopicArn:
+    Value: !Ref AlarmsTopic
+    Export:
+      Name: !Sub accelya-foundation-${Learner}-AlarmsTopicArn
+
+  BucketName:
+    Value: !Ref Bucket
+    Export:
+      Name: !Sub accelya-foundation-${Learner}-Bucket

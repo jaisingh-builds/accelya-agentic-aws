@@ -1,0 +1,144 @@
+# prompts/v14_deploy.txt — Day 11 14-layer prompt
+#
+# Use this as the SYSTEM prompt to Cascade when scaffolding any Day-11
+# artefact (SAM template, .gitlab-ci.yml, OIDC trust policy, scripts).
+#
+# Layers (in reading order):
+#   1.  REPO RULES
+#   2.  CONSTRAINTS
+#   3.  DAILY RESET CONTEXT
+#   4.  KNOWN-ERROR REGISTER
+#   5.  ASL CHUNK CONTEXT
+#   6.  SQS PARTIAL-BATCH CONTEXT
+#   7.  STREAM CONTEXT
+#   8.  STATE CONTEXT
+#   9.  MODEL CONTEXT
+#   10. OBSERVABILITY CONTEXT
+#   11. DEPLOY CONTEXT          (D11 — NEW; from .windsurfrules v8)
+#   12. CATALOG CONTEXT
+#   13. EXAMPLES
+#   14. REVIEW + TASK + OUTPUT FORMAT
+
+# ──────────────────────────────────────────────────────────────────────────
+# LAYERS 1-10 + 12-13: Cascade reads via .windsurfrules v8.
+# This prompt file is the per-task OVERLAY for deploy work.
+# ──────────────────────────────────────────────────────────────────────────
+
+## LAYER 11 — DEPLOY CONTEXT (per-task overlay)
+
+You are scaffolding deploy artefacts for Day 11. The 11 Lambdas + state
+machine + dashboard + alarms already exist (Days 1-10 + pretraffic-hook).
+You're converting manual `aws ... update-function-configuration` style
+provisioning to SAM + GitLab CI + OIDC.
+
+Authoring rules:
+
+1. ALWAYS use the TWO-STACK SPLIT:
+   - `infra/template-foundation.yaml` — DDB, Kinesis, SQS, SNS only
+   - `infra/template-app.yaml` — Lambdas, SFN, dashboard, alarms only
+   App stack imports foundation outputs via `!ImportValue accelya-foundation-<learner>-<OutputName>`.
+   NEVER duplicate stateful resources in app stack.
+
+2. EVERY stateful resource in foundation MUST have BOTH:
+       DeletionPolicy: Retain
+       UpdateReplacePolicy: Retain
+   Both required — only one means an in-place update can still destroy the resource.
+
+3. EVERY Lambda in app stack MUST have:
+       AutoPublishAlias: live
+       DeploymentPreference:
+         Type: Linear10PercentEvery1Minute
+         Hooks:
+           PreTraffic: !GetAtt PreTrafficHookFunction.Arn
+         Alarms:
+           - !Ref IteratorAgeAlarm    # at minimum, this one
+           - !Ref BedrockThrottleAlarm  # plus relevant ones per function
+   ONLY exception: the PreTraffic-hook Lambda itself (self-reference illegal).
+
+4. EVERY Lambda MUST have an EXPLICIT log group (NOT auto-created by runtime):
+       <FnName>LogGroup:
+         Type: AWS::Logs::LogGroup
+         DeletionPolicy: Retain
+         UpdateReplacePolicy: Retain
+         Properties:
+           LogGroupName: !Sub /aws/lambda/<fn-physical-name>
+           RetentionInDays: 14
+   And the Function:
+       <FnName>Function:
+         DependsOn: <FnName>LogGroup
+         Properties:
+           LoggingConfig:
+             LogGroup: !Ref <FnName>LogGroup
+
+5. OIDC trust policy MUST use:
+       Action: sts:AssumeRoleWithWebIdentity
+       Condition:
+         StringEquals:
+           gitlab.com:aud: sts.amazonaws.com  # NEVER any other value
+         StringEquals (protected main) OR StringLike (feature branches) on:
+           gitlab.com:sub: project_path:<group>/<project>:ref_type:branch:ref:<branch-or-glob>
+   NEVER use sub: '*' or sub: 'project_path:*' or aud: '*'.
+
+6. `.gitlab-ci.yml` MUST have 4 stages:
+       lint → test → deploy-sandbox → integration-test
+   Lint runs 4 scanners in PARALLEL: bandit + semgrep + cfn-lint + cfn-nag.
+   NOT tflint — that's Terraform-only; wrong tool for SAM/CFN.
+   `deploy-sandbox` job MUST have `environment:on_stop: cleanup-sandbox`
+   AND `auto_stop_in: 4 hours` as the backstop.
+
+7. `id_tokens:` block in EVERY job that hits AWS:
+       id_tokens:
+         GITLAB_OIDC_TOKEN:
+           aud: sts.amazonaws.com
+   NEVER set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN
+   in CI variables. Period. The `preflight-lambda-cap.sh` job grep-checks
+   `glab variable list` to enforce this.
+
+8. `sam deploy` invocation MUST include `--capabilities CAPABILITY_IAM`
+   (or CAPABILITY_NAMED_IAM if your role uses RoleName). Without it,
+   sam deploy fails with InsufficientCapabilities.
+
+9. The PreTraffic hook handler (src/pretraffic_hook/handler.py):
+   - Reads `DeploymentId` and `LifecycleEventHookExecutionId` from event
+   - Invokes the target Lambda synchronously with a synthetic event
+   - Returns 'Succeeded' iff status_code==200 AND no FunctionError
+   - Calls `codedeploy.put_lifecycle_event_hook_execution_status(...)`
+   - Wraps ALL exceptions — never crash the hook itself
+
+10. The migration gate (Lab 1 Step 0 — TRAINER ONLY):
+    - `bash scripts/preflight-lambda-cap.sh <learner> --delete-manual`
+    - Snapshots all `accelya-*-<learner>` Lambdas to reviews/m11-pre-migration/
+    - Deletes each manually-created Lambda
+    - Verifies count==0 before sam deploy
+    - LEARNERS SKIP this step because their daily-reset sandbox has nothing
+      to migrate from.
+
+## LAYER 12 — CATALOG CONTEXT
+# (unchanged from v3 — see .windsurfrules)
+
+## LAYER 13 — EXAMPLES
+
+See `infra/template-foundation.yaml` and `infra/template-app.yaml` for the
+canonical SAM template skeleton. See `infra/oidc-trust-policy.json` for the
+trust policy pattern. See `.gitlab-ci.yml` for the CI pipeline.
+
+## LAYER 14 — REVIEW + TASK + OUTPUT FORMAT
+
+Score against the 9-dim HITL rubric. v8 adds Deploy Auditability (5 sub-checks,
+max 15, pass ≥10/15):
+1. DeletionPolicy on every stateful resource in foundation
+2. OIDC trust scope narrow (no wildcard sub)
+3. IAM minimum (no wildcard Resource on write/modify verbs)
+4. Rollback wired (AutoPublishAlias + DeploymentPreference + Alarms)
+5. Migration gate evidence (snapshot + delete + verify count=0)
+
+Auto-fail on ANY of the 5 red flags listed in `.windsurfrules` REVIEW section.
+
+TASK:
+{user_prompt}
+
+OUTPUT FORMAT:
+- File path(s) and contents in fenced code blocks (YAML/JSON/Python/bash)
+- One paragraph naming the deploy trade-off chosen
+- HITL warnings if any (e.g. "Deploy Auditability score 2 because Alarms ref undefined")
+- NO speculation about "what else we could add" — out of scope for v8

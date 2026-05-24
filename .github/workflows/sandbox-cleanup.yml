@@ -1,0 +1,68 @@
+# .github/workflows/sandbox-cleanup.yml — tears down the per-PR sandbox stack
+# when the PR closes (merged or closed without merge).
+#
+# This is GitHub's equivalent of GitLab's `environment:on_stop:` block.
+# GitHub doesn't have a built-in "stop environment" hook, so we trigger
+# on the `pull_request: closed` event directly.
+
+name: Accelya sandbox cleanup
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+  workflow_dispatch:        # manual cleanup
+    inputs:
+      pr_number:
+        description: 'PR number whose sandbox stack to delete'
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+
+jobs:
+  cleanup-sandbox:
+    name: Cleanup · delete app stack
+    runs-on: ubuntu-latest
+    environment:
+      name: pr-${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+
+    steps:
+      - name: Determine PR number
+        id: pr
+        run: |
+          PR_NUM="${{ github.event.pull_request.number || github.event.inputs.pr_number }}"
+          if [ -z "$PR_NUM" ]; then
+            echo "❌ No PR number"; exit 1
+          fi
+          echo "number=$PR_NUM" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gh-cleanup-pr${{ steps.pr.outputs.number }}
+
+      - name: Delete app stack
+        run: |
+          STACK=accelya-app-pr-${{ steps.pr.outputs.number }}
+          if aws cloudformation describe-stacks --stack-name "$STACK" --region $AWS_REGION >/dev/null 2>&1; then
+            echo "Deleting $STACK ..."
+            aws cloudformation delete-stack --stack-name "$STACK" --region $AWS_REGION
+            aws cloudformation wait stack-delete-complete --stack-name "$STACK" --region $AWS_REGION
+            echo "✓ Deleted"
+          else
+            echo "Stack $STACK not present (already cleaned)"
+          fi
+
+      - name: Confirm zero remaining sandbox stacks for this PR
+        run: |
+          aws cloudformation list-stacks --region $AWS_REGION \
+            --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE ROLLBACK_COMPLETE \
+            --query "StackSummaries[?StackName=='accelya-app-pr-${{ steps.pr.outputs.number }}'].StackName" \
+            --output text

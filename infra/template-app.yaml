@@ -1,0 +1,333 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Accelya APP stack — ephemeral compute + observability.
+  Deployed per MR by GitLab CI (stack name accelya-app-<branch-slug>).
+  References foundation stack via !ImportValue.
+  Every Lambda has AutoPublishAlias + DeploymentPreference + Alarms.
+
+Parameters:
+  Learner:
+    Type: String
+    AllowedPattern: '^[a-z][a-z0-9-]*$'
+    Description: Lowercase learner suffix (matches foundation stack)
+
+  BedrockModelId:
+    Type: String
+    Default: apac.anthropic.claude-3-5-sonnet-20241022-v2:0
+
+  ConfidenceThreshold:
+    Type: String
+    Default: '0.7'
+
+  SampleRate:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 100
+
+# ──────────────────────────────────────────────────────────────────────────
+# Globals — cross-cutting Lambda defaults
+# ──────────────────────────────────────────────────────────────────────────
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [x86_64]
+    Timeout: 30
+    MemorySize: 256
+    Tracing: Active
+    Environment:
+      Variables:
+        LOG_LEVEL: INFO
+        LEARNER: !Ref Learner
+        POWERTOOLS_SERVICE_NAME: !Ref AWS::StackName
+        POWERTOOLS_METRICS_NAMESPACE: Accelya/Pipeline
+    Tags:
+      programme: accelya
+      owner: !Ref Learner
+      environment: lab
+
+Resources:
+  # ════════════════════════════════════════════════════════════════════
+  # IAM — single execution role for all Lambdas (tightened from D10)
+  # ════════════════════════════════════════════════════════════════════
+  PipelineExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub accelya-pipeline-role-${Learner}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: [lambda.amazonaws.com] }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: accelya-pipeline-inline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: S3Data
+                Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject, s3:ListBucket]
+                Resource:
+                  - !Sub arn:aws:s3:::{{resolve:ssm:/accelya/bucket-name:1}}
+                  - !Sub arn:aws:s3:::{{resolve:ssm:/accelya/bucket-name:1}}/*
+              - Sid: DDB
+                Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:GetItem, dynamodb:UpdateItem, dynamodb:Query]
+                Resource:
+                  Fn::ImportValue: !Sub accelya-foundation-${Learner}-DDBArn
+              - Sid: BedrockInvoke
+                Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !Sub arn:aws:bedrock:${AWS::Region}::inference-profile/${BedrockModelId}
+              - Sid: SageMakerInvoke
+                Effect: Allow
+                Action: sagemaker:InvokeEndpoint
+                Resource: !Sub arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/accelya-cancel-risk-${Learner}
+              - Sid: KinesisRead
+                Effect: Allow
+                Action: [kinesis:GetRecords, kinesis:GetShardIterator, kinesis:DescribeStream,
+                         kinesis:DescribeStreamSummary, kinesis:ListShards]
+                Resource:
+                  Fn::ImportValue: !Sub accelya-foundation-${Learner}-StreamArn
+              - Sid: KinesisWrite
+                Effect: Allow
+                Action: [kinesis:PutRecord, kinesis:PutRecords]
+                Resource:
+                  Fn::ImportValue: !Sub accelya-foundation-${Learner}-StreamArn
+              - Sid: SQS
+                Effect: Allow
+                Action: [sqs:SendMessage, sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
+                Resource:
+                  - Fn::ImportValue: !Sub accelya-foundation-${Learner}-DlqArn
+                  - !Sub
+                    - arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${Url}
+                    - Url:
+                        Fn::ImportValue: !Sub accelya-foundation-${Learner}-ReviewQueueUrl
+              - Sid: SFN
+                Effect: Allow
+                Action: states:StartExecution
+                Resource: !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:inference-pipeline-${Learner}
+              - Sid: SNSPub
+                Effect: Allow
+                Action: sns:Publish
+                Resource:
+                  - Fn::ImportValue: !Sub accelya-foundation-${Learner}-AlarmsTopicArn
+                  - Fn::ImportValue: !Sub accelya-foundation-${Learner}-EscalationTopicArn
+
+  # ════════════════════════════════════════════════════════════════════
+  # Log groups (explicit, retained, 14 days) — one per Lambda
+  # ════════════════════════════════════════════════════════════════════
+  PredictLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub /aws/lambda/accelya-predict-cancel-risk-${Learner}
+      RetentionInDays: 14
+
+  BedrockEnrichLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub /aws/lambda/accelya-bedrock-enrich-${Learner}
+      RetentionInDays: 14
+
+  PreTrafficHookLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub /aws/lambda/accelya-pretraffic-hook-${Learner}
+      RetentionInDays: 14
+
+  # (... 8 more log groups follow the same pattern; omitted here for brevity.
+  # The trainer deploy script's full template includes all 11.)
+
+  # ════════════════════════════════════════════════════════════════════
+  # Day-10 alarms — referenced from each Lambda's DeploymentPreference
+  # ════════════════════════════════════════════════════════════════════
+  IteratorAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub iterator-age-${Learner}
+      MetricName: GetRecords.IteratorAgeMilliseconds
+      Namespace: AWS/Kinesis
+      Dimensions:
+        - Name: StreamName
+          Value:
+            Fn::ImportValue: !Sub accelya-foundation-${Learner}-StreamName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 5
+      Threshold: 60000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - Fn::ImportValue: !Sub accelya-foundation-${Learner}-AlarmsTopicArn
+      OKActions:
+        - Fn::ImportValue: !Sub accelya-foundation-${Learner}-AlarmsTopicArn
+
+  BedrockThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub bedrock-throttle-${Learner}
+      MetricName: InvocationThrottles
+      Namespace: AWS/Bedrock
+      Dimensions:
+        - Name: ModelId
+          Value: !Ref BedrockModelId
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - Fn::ImportValue: !Sub accelya-foundation-${Learner}-AlarmsTopicArn
+
+  ConfidenceDriftAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub confidence-drift-${Learner}
+      AlarmDescription: predict HourlyConfidenceMean outside ANOMALY_DETECTION_BAND (2-sigma)
+      Metrics:
+        - Id: m_curr
+          Label: HourlyConfidenceMean
+          ReturnData: true
+          MetricStat:
+            Metric:
+              Namespace: Accelya/Pipeline
+              MetricName: HourlyConfidenceMean
+              Dimensions:
+                - { Name: service, Value: predict-cancel-risk }
+            Period: 3600
+            Stat: Average
+        - Id: ad1
+          Label: ConfidenceMean (ExpectedRange)
+          Expression: ANOMALY_DETECTION_BAND(m_curr, 2)
+          ReturnData: true
+      ThresholdMetricId: ad1
+      ComparisonOperator: LessThanLowerOrGreaterThanUpperThreshold
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - Fn::ImportValue: !Sub accelya-foundation-${Learner}-AlarmsTopicArn
+
+  # ════════════════════════════════════════════════════════════════════
+  # PreTraffic hook (Lambda #11 — only NEW Lambda today)
+  # No DeploymentPreference on this one (would be self-referential)
+  # ════════════════════════════════════════════════════════════════════
+  PreTrafficHookFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: PreTrafficHookLogGroup
+    Properties:
+      FunctionName: !Sub accelya-pretraffic-hook-${Learner}
+      CodeUri: ../src/pretraffic_hook/
+      Handler: handler.handler
+      Timeout: 60
+      MemorySize: 256
+      Role: !GetAtt PipelineExecutionRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref PreTrafficHookLogGroup
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - codedeploy:PutLifecycleEventHookExecutionStatus
+              Resource: '*'
+            - Effect: Allow
+              Action: [lambda:InvokeFunction]
+              Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:accelya-*-${Learner}:*
+
+  # ════════════════════════════════════════════════════════════════════
+  # Predict wrapper Lambda — the canonical example
+  # (same AutoPublishAlias + DeploymentPreference pattern on all 10 others)
+  # ════════════════════════════════════════════════════════════════════
+  PredictFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: PredictLogGroup
+    Properties:
+      FunctionName: !Sub accelya-predict-cancel-risk-${Learner}
+      CodeUri: ../src/predict/
+      Handler: handler.handler
+      MemorySize: 512
+      Timeout: 45
+      Role: !GetAtt PipelineExecutionRole.Arn
+      Environment:
+        Variables:
+          ENDPOINT_NAME: !Sub accelya-cancel-risk-${Learner}
+          CONFIDENCE_THRESHOLD: !Ref ConfidenceThreshold
+      LoggingConfig:
+        LogGroup: !Ref PredictLogGroup
+      AutoPublishAlias: live
+      DeploymentPreference:
+        Type: Linear10PercentEvery1Minute
+        Hooks:
+          PreTraffic: !GetAtt PreTrafficHookFunction.Arn
+        Alarms:
+          - !Ref IteratorAgeAlarm
+          - !Ref BedrockThrottleAlarm
+
+  # ════════════════════════════════════════════════════════════════════
+  # Bedrock-enrich Lambda — second canonical example
+  # ════════════════════════════════════════════════════════════════════
+  BedrockEnrichFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: BedrockEnrichLogGroup
+    Properties:
+      FunctionName: !Sub accelya-bedrock-enrich-${Learner}
+      CodeUri: ../src/bedrock_enrich/
+      Handler: handler.handler
+      MemorySize: 512
+      Timeout: 60
+      Role: !GetAtt PipelineExecutionRole.Arn
+      Environment:
+        Variables:
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          SAMPLE_RATE: !Ref SampleRate
+      LoggingConfig:
+        LogGroup: !Ref BedrockEnrichLogGroup
+      AutoPublishAlias: live
+      DeploymentPreference:
+        Type: Linear10PercentEvery1Minute
+        Hooks:
+          PreTraffic: !GetAtt PreTrafficHookFunction.Arn
+        Alarms:
+          - !Ref BedrockThrottleAlarm
+
+  # ────────────────────────────────────────────────────────────────────
+  # NOTE: The other 8 Lambdas (validator / lander / chunker / dlq-replayer /
+  #       etl-json-to-parquet / producer / consumer / persist-enriched)
+  #       follow the EXACT SAME pattern as PredictFunction above:
+  #       - DependsOn log group
+  #       - CodeUri ../src/<name>/
+  #       - Role: PipelineExecutionRole
+  #       - AutoPublishAlias: live
+  #       - DeploymentPreference with PreTraffic + Alarms
+  #       Omitted here for readability; trainer deploy script generates
+  #       the full template. Cascade with v8 .windsurfrules expands them
+  #       correctly from the standard skeleton.
+  # ────────────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────────────
+Outputs:
+  PipelineExecutionRoleArn:
+    Value: !GetAtt PipelineExecutionRole.Arn
+    Export:
+      Name: !Sub accelya-app-${Learner}-RoleArn
+
+  PredictFunctionArn:
+    Value: !Ref PredictFunction.Alias
+    Description: Lambda alias `live` ARN (always points at latest deployed version)
+
+  PreTrafficHookArn:
+    Value: !GetAtt PreTrafficHookFunction.Arn

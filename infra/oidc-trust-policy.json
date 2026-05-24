@@ -1,0 +1,70 @@
+{
+  "_comment": "Trust policy for accelya-github-oidc-<learner> IAM role. Render with `sed -e 's/<account>/.../' -e 's/<owner>/.../' -e 's/<repo>/.../' -e 's/<learner>/.../' before applying. Audience MUST be sts.amazonaws.com (default AWS STS audience). Sub MUST be scoped to <owner>/<repo> — never wildcard the repo path.",
+  "_repo_default": "jaisingh-builds/accelya-agentic-aws",
+  "_audience": "sts.amazonaws.com (set by aws-actions/configure-aws-credentials by default)",
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowProtectedMainDeploys",
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::<account>:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+          "token.actions.githubusercontent.com:sub": "repo:<owner>/<repo>:ref:refs/heads/main"
+        }
+      }
+    },
+    {
+      "Sid": "AllowModule11FeatureBranchDeploys",
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::<account>:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+        },
+        "StringLike": {
+          "token.actions.githubusercontent.com:sub": "repo:<owner>/<repo>:ref:refs/heads/module-11-*"
+        }
+      }
+    },
+    {
+      "Sid": "AllowPullRequestSandboxDeploys",
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::<account>:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+        },
+        "StringLike": {
+          "token.actions.githubusercontent.com:sub": "repo:<owner>/<repo>:pull_request"
+        }
+      }
+    },
+    {
+      "Sid": "AllowCapstoneBranchDeploys",
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::<account>:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+        },
+        "StringLike": {
+          "token.actions.githubusercontent.com:sub": "repo:<owner>/<repo>:ref:refs/heads/capstone-*"
+        }
+      }
+    }
+  ]
+}
