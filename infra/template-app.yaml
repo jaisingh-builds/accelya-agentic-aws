@@ -10,7 +10,18 @@ Parameters:
   Learner:
     Type: String
     AllowedPattern: '^[a-z][a-z0-9-]*$'
-    Description: Lowercase learner suffix (matches foundation stack)
+    Description: Lowercase learner suffix (per-stack identity for ephemeral resources)
+
+  FoundationLearner:
+    Type: String
+    Default: trainer
+    AllowedPattern: '^[a-z][a-z0-9-]*$'
+    Description: >
+      Suffix of the foundation stack to import shared stateful resources from
+      (DDB, Kinesis, SQS, SNS, S3). Defaults to 'trainer' — the cohort-wide
+      foundation. CI passes Learner=pr-N for ephemeral app names but keeps
+      FoundationLearner=trainer so per-PR sandboxes share one foundation
+      (avoids 10 DDB tables + 10 Kinesis streams per cohort).
 
   BedrockModelId:
     Type: String
@@ -77,15 +88,15 @@ Resources:
                   # source of truth — avoids SSM Parameter Store coupling).
                   - !Sub
                     - arn:aws:s3:::${B}
-                    - B: { Fn::ImportValue: !Sub "accelya-foundation-${Learner}-Bucket" }
+                    - B: { Fn::ImportValue: !Sub "accelya-foundation-${FoundationLearner}-Bucket" }
                   - !Sub
                     - arn:aws:s3:::${B}/*
-                    - B: { Fn::ImportValue: !Sub "accelya-foundation-${Learner}-Bucket" }
+                    - B: { Fn::ImportValue: !Sub "accelya-foundation-${FoundationLearner}-Bucket" }
               - Sid: DDB
                 Effect: Allow
                 Action: [dynamodb:PutItem, dynamodb:GetItem, dynamodb:UpdateItem, dynamodb:Query]
                 Resource:
-                  Fn::ImportValue: !Sub accelya-foundation-${Learner}-DDBArn
+                  Fn::ImportValue: !Sub accelya-foundation-${FoundationLearner}-DDBArn
               - Sid: BedrockInvoke
                 Effect: Allow
                 Action: bedrock:InvokeModel
@@ -99,21 +110,21 @@ Resources:
                 Action: [kinesis:GetRecords, kinesis:GetShardIterator, kinesis:DescribeStream,
                          kinesis:DescribeStreamSummary, kinesis:ListShards]
                 Resource:
-                  Fn::ImportValue: !Sub accelya-foundation-${Learner}-StreamArn
+                  Fn::ImportValue: !Sub accelya-foundation-${FoundationLearner}-StreamArn
               - Sid: KinesisWrite
                 Effect: Allow
                 Action: [kinesis:PutRecord, kinesis:PutRecords]
                 Resource:
-                  Fn::ImportValue: !Sub accelya-foundation-${Learner}-StreamArn
+                  Fn::ImportValue: !Sub accelya-foundation-${FoundationLearner}-StreamArn
               - Sid: SQS
                 Effect: Allow
                 Action: [sqs:SendMessage, sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
                 Resource:
-                  - Fn::ImportValue: !Sub accelya-foundation-${Learner}-DlqArn
+                  - Fn::ImportValue: !Sub accelya-foundation-${FoundationLearner}-DlqArn
                   - !Sub
                     - arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${Url}
                     - Url:
-                        Fn::ImportValue: !Sub accelya-foundation-${Learner}-ReviewQueueUrl
+                        Fn::ImportValue: !Sub accelya-foundation-${FoundationLearner}-ReviewQueueUrl
               - Sid: SFN
                 Effect: Allow
                 Action: states:StartExecution
@@ -122,8 +133,8 @@ Resources:
                 Effect: Allow
                 Action: sns:Publish
                 Resource:
-                  - Fn::ImportValue: !Sub accelya-foundation-${Learner}-AlarmsTopicArn
-                  - Fn::ImportValue: !Sub accelya-foundation-${Learner}-EscalationTopicArn
+                  - Fn::ImportValue: !Sub accelya-foundation-${FoundationLearner}-AlarmsTopicArn
+                  - Fn::ImportValue: !Sub accelya-foundation-${FoundationLearner}-EscalationTopicArn
 
   # ════════════════════════════════════════════════════════════════════
   # Log groups (explicit, retained, 14 days) — one per Lambda
@@ -167,7 +178,7 @@ Resources:
       Dimensions:
         - Name: StreamName
           Value:
-            Fn::ImportValue: !Sub accelya-foundation-${Learner}-StreamName
+            Fn::ImportValue: !Sub accelya-foundation-${FoundationLearner}-StreamName
       Statistic: Maximum
       Period: 60
       EvaluationPeriods: 5
@@ -176,9 +187,9 @@ Resources:
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
       AlarmActions:
-        - Fn::ImportValue: !Sub accelya-foundation-${Learner}-AlarmsTopicArn
+        - Fn::ImportValue: !Sub accelya-foundation-${FoundationLearner}-AlarmsTopicArn
       OKActions:
-        - Fn::ImportValue: !Sub accelya-foundation-${Learner}-AlarmsTopicArn
+        - Fn::ImportValue: !Sub accelya-foundation-${FoundationLearner}-AlarmsTopicArn
 
   BedrockThrottleAlarm:
     Type: AWS::CloudWatch::Alarm
@@ -197,7 +208,7 @@ Resources:
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
       AlarmActions:
-        - Fn::ImportValue: !Sub accelya-foundation-${Learner}-AlarmsTopicArn
+        - Fn::ImportValue: !Sub accelya-foundation-${FoundationLearner}-AlarmsTopicArn
 
   ConfidenceDriftAlarm:
     Type: AWS::CloudWatch::Alarm
@@ -226,7 +237,7 @@ Resources:
       DatapointsToAlarm: 1
       TreatMissingData: notBreaching
       AlarmActions:
-        - Fn::ImportValue: !Sub accelya-foundation-${Learner}-AlarmsTopicArn
+        - Fn::ImportValue: !Sub accelya-foundation-${FoundationLearner}-AlarmsTopicArn
 
   # ════════════════════════════════════════════════════════════════════
   # PreTraffic hook (Lambda #11 — only NEW Lambda today)

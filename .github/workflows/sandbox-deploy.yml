@@ -177,7 +177,7 @@ jobs:
             --stack-name "accelya-app-pr-${PR_NUMBER}" \
             --resolve-s3 \
             --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
-            --parameter-overrides "Learner=pr-${PR_NUMBER}" \
+            --parameter-overrides "Learner=pr-${PR_NUMBER}" "FoundationLearner=trainer" \
             --no-confirm-changeset \
             --no-fail-on-empty-changeset \
             --tags programme=accelya "pr=${PR_NUMBER}" environment=sandbox
