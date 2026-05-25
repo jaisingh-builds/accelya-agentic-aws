@@ -645,10 +645,14 @@ if [[ "$DAY" -ge 11 && "$MODE" != "verify-only" ]]; then
     python3 - <<PY > /tmp/${LEARNER}-trust-clean.json
 import json
 with open("/tmp/${LEARNER}-trust.json") as f: d = json.load(f)
-d.pop("_comment", None)
-d.pop("_repo_default", None)
-d.pop("_audience", None)
-print(json.dumps(d, separators=(',', ':')))
+# Strip ALL annotation fields recursively (keys starting with _)
+def strip(o):
+    if isinstance(o, dict):
+        return {k: strip(v) for k, v in o.items() if not (isinstance(k, str) and k.startswith("_"))}
+    if isinstance(o, list):
+        return [strip(x) for x in o]
+    return o
+print(json.dumps(strip(d), separators=(',', ':')))
 PY
     if aws iam get-role --role-name "$OIDC_ROLE_NAME" >/dev/null 2>&1; then
       aws iam update-assume-role-policy --role-name "$OIDC_ROLE_NAME" \

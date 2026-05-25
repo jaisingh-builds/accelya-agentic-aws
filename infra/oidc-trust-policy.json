@@ -1,11 +1,10 @@
 {
-  "_comment": "Trust policy for accelya-github-oidc-<learner> IAM role. Render with `sed -e 's/<account>/.../' -e 's/<owner>/.../' -e 's/<repo>/.../' -e 's/<learner>/.../' before applying. Audience MUST be sts.amazonaws.com (default AWS STS audience). Sub MUST be scoped to <owner>/<repo> — never wildcard the repo path.",
+  "_comment": "Trust policy for accelya-github-oidc-<learner> IAM role. Audience MUST be sts.amazonaws.com (default for aws-actions/configure-aws-credentials@v4). Sub MUST be scoped to <owner>/<repo> — never wildcard the repo path. Consolidated to 2 statements to fit under IAM's 2048-byte trust policy quota.",
   "_repo_default": "jaisingh-builds/accelya-agentic-aws",
-  "_audience": "sts.amazonaws.com (set by aws-actions/configure-aws-credentials by default)",
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "AllowProtectedMainDeploys",
+      "Sid": "ProtectedMain",
       "Effect": "Allow",
       "Principal": {
         "Federated": "arn:aws:iam::<account>:oidc-provider/token.actions.githubusercontent.com"
@@ -19,7 +18,8 @@
       }
     },
     {
-      "Sid": "AllowModule11FeatureBranchDeploys",
+      "Sid": "SandboxBranchesAndEnvironments",
+      "_why": "One statement covers: module-11-* branches, capstone-* branches, :pull_request claims, and :environment:pr-* claims (the GH Environment-bound deploy/cleanup/integration-test jobs). Each pattern is repo-pinned — never matches another GitHub repo.",
       "Effect": "Allow",
       "Principal": {
         "Federated": "arn:aws:iam::<account>:oidc-provider/token.actions.githubusercontent.com"
@@ -30,39 +30,12 @@
           "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
         },
         "StringLike": {
-          "token.actions.githubusercontent.com:sub": "repo:<owner>/<repo>:ref:refs/heads/module-11-*"
-        }
-      }
-    },
-    {
-      "Sid": "AllowPullRequestSandboxDeploys",
-      "Effect": "Allow",
-      "Principal": {
-        "Federated": "arn:aws:iam::<account>:oidc-provider/token.actions.githubusercontent.com"
-      },
-      "Action": "sts:AssumeRoleWithWebIdentity",
-      "Condition": {
-        "StringEquals": {
-          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
-        },
-        "StringLike": {
-          "token.actions.githubusercontent.com:sub": "repo:<owner>/<repo>:pull_request"
-        }
-      }
-    },
-    {
-      "Sid": "AllowCapstoneBranchDeploys",
-      "Effect": "Allow",
-      "Principal": {
-        "Federated": "arn:aws:iam::<account>:oidc-provider/token.actions.githubusercontent.com"
-      },
-      "Action": "sts:AssumeRoleWithWebIdentity",
-      "Condition": {
-        "StringEquals": {
-          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
-        },
-        "StringLike": {
-          "token.actions.githubusercontent.com:sub": "repo:<owner>/<repo>:ref:refs/heads/capstone-*"
+          "token.actions.githubusercontent.com:sub": [
+            "repo:<owner>/<repo>:ref:refs/heads/module-11-*",
+            "repo:<owner>/<repo>:ref:refs/heads/capstone-*",
+            "repo:<owner>/<repo>:pull_request",
+            "repo:<owner>/<repo>:environment:pr-*"
+          ]
         }
       }
     }
