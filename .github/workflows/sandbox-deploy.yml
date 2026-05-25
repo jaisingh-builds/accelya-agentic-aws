@@ -74,18 +74,17 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '${{ env.PYTHON_VERSION }}' }
-      # Pin cfn-lint to a known-good version; the 1.5x series changed how
-      # SAM Transform templates are loaded. v1.32 handles `Transform: AWS::Serverless-*`
-      # without trying to validate the post-expansion CFN (which it can't,
-      # without running the macro server-side).
-      - run: pip install --quiet 'cfn-lint==1.32.4'
+      # Pin cfn-lint to a recent stable. The 1.32.x series has a known bug
+      # where SAM Transform templates fail to load with `E1001 Resources missing
+      # at None:1:1` — the loader bails before identifying the filename.
+      # Fixed in 1.40+; we pin to 1.40.0 specifically for reproducibility.
+      - run: pip install --quiet 'cfn-lint==1.40.0'
       # Suppressions:
       #   W3005 — DependsOn on LogGroup is intentional belt-and-braces
       #           (prevents Lambda runtime racing CFN-managed log group creation)
-      #   E1001 — false-positive on SAM templates: cfn-lint can't pre-expand the
-      #           Transform macro, occasionally fails to find `Resources:` at the
-      #           pre-transform stage. `sam validate` (run in deploy-sandbox) is
-      #           the authoritative check; cfn-lint is for schema sanity.
+      #   E1001 — kept-suppressed on app stack as a fallback in case any future
+      #           cfn-lint regression on SAM Transform reappears. Authoritative
+      #           check is `sam validate` (run in deploy-sandbox).
       # Invoke per-file so the failure message names the offending template
       # instead of `None:1:1` from glob-expansion ambiguity.
       - name: cfn-lint foundation
