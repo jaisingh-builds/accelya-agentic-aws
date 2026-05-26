@@ -40,3 +40,11 @@ data/generated/
 
 # Local trainer scratch
 scratch/
+
+# SAM
+.aws-sam/
+
+# Note: src/common-layer/python/common/ IS committed to the repo. It's a
+# copy of src/common/ that SAM packages as the AccelyaCommonLayer Lambda
+# Layer. Trainer responsibility: re-sync via the deploy script's pre-build
+# step (cp -r src/common/* src/common-layer/python/common/).

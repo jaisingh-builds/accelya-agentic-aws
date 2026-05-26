@@ -1,0 +1,187 @@
+# .gitlab-ci.yml — Accelya Agentic AWS pipeline (Day 11)
+#
+# 4 stages: lint → test → deploy-sandbox → integration-test
+# OIDC: id_tokens.GITLAB_OIDC_TOKEN.aud: sts.amazonaws.com (NEVER static AWS keys)
+# Sandbox-per-MR: environment:on_stop auto-deletes app stack on MR close.
+
+stages:
+  - lint
+  - test
+  - deploy-sandbox
+  - integration-test
+
+variables:
+  AWS_REGION: ap-south-1
+  SAM_CLI_TELEMETRY: '0'
+  PYTHON_VERSION: '3.12'
+
+# ──────────────────────────────────────────────────────────────────────────
+# Reusable OIDC assume-role block
+# ──────────────────────────────────────────────────────────────────────────
+.oidc-assume: &oidc-assume
+  before_script:
+    - apk add --no-cache curl jq aws-cli 2>/dev/null || (apt-get update && apt-get install -y curl jq awscli)
+    - |
+      CREDS=$(aws sts assume-role-with-web-identity \
+        --role-arn "$AWS_OIDC_ROLE_ARN" \
+        --role-session-name "gitlab-${CI_PIPELINE_ID}-${CI_JOB_ID}" \
+        --web-identity-token "$GITLAB_OIDC_TOKEN" \
+        --duration-seconds 3600 \
+        --output json)
+    - export AWS_ACCESS_KEY_ID=$(echo $CREDS | jq -r .Credentials.AccessKeyId)
+    - export AWS_SECRET_ACCESS_KEY=$(echo $CREDS | jq -r .Credentials.SecretAccessKey)
+    - export AWS_SESSION_TOKEN=$(echo $CREDS | jq -r .Credentials.SessionToken)
+    - aws sts get-caller-identity   # sanity check
+
+# ──────────────────────────────────────────────────────────────────────────
+# LINT stage (4 scanners; runs on MR + main; all parallel via needs:[])
+# ──────────────────────────────────────────────────────────────────────────
+.lint-rules: &lint-rules
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+bandit:
+  <<: *lint-rules
+  stage: lint
+  needs: []
+  image: python:${PYTHON_VERSION}-slim
+  script:
+    - pip install --quiet bandit
+    - bandit -r src/ -f json -o bandit.json -ll || (cat bandit.json; exit 1)
+  artifacts:
+    paths: [bandit.json]
+    when: always
+
+semgrep:
+  <<: *lint-rules
+  stage: lint
+  needs: []
+  image: returntocorp/semgrep:latest
+  script:
+    - semgrep ci --config auto --json --output semgrep.json
+  artifacts:
+    paths: [semgrep.json]
+    when: always
+
+cfn-lint:
+  <<: *lint-rules
+  stage: lint
+  needs: []
+  image: python:${PYTHON_VERSION}-slim
+  script:
+    - pip install --quiet cfn-lint
+    - cfn-lint infra/template-*.yaml
+
+cfn-nag:
+  <<: *lint-rules
+  stage: lint
+  needs: []
+  image: stelligent/cfn_nag:latest
+  script:
+    - cfn_nag_scan --input-path infra/template-foundation.yaml --output-format json
+    - cfn_nag_scan --input-path infra/template-app.yaml --output-format json
+
+preflight-lambda-cap:
+  <<: *lint-rules
+  stage: lint
+  needs: []
+  image: amazonlinux:2023
+  id_tokens:
+    GITLAB_OIDC_TOKEN: { aud: sts.amazonaws.com }
+  <<: *oidc-assume
+  script:
+    - bash scripts/preflight-lambda-cap.sh "$CI_COMMIT_REF_SLUG"
+
+# ──────────────────────────────────────────────────────────────────────────
+# TEST stage (pytest; parallel with lint)
+# ──────────────────────────────────────────────────────────────────────────
+unit-tests:
+  <<: *lint-rules
+  stage: test
+  needs: []
+  image: python:${PYTHON_VERSION}-slim
+  script:
+    - pip install --quiet -r requirements.txt
+    - pip install --quiet pytest pytest-cov
+    - pytest tests/ -v --junitxml=junit.xml --cov=src --cov-report=xml
+  artifacts:
+    reports:
+      junit: junit.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+
+# ──────────────────────────────────────────────────────────────────────────
+# DEPLOY-SANDBOX (per-MR app stack; on_stop auto-deletes)
+# ──────────────────────────────────────────────────────────────────────────
+deploy-sandbox:
+  stage: deploy-sandbox
+  needs:
+    - job: bandit
+    - job: semgrep
+    - job: cfn-lint
+    - job: cfn-nag
+    - job: preflight-lambda-cap
+    - job: unit-tests
+  image: public.ecr.aws/sam/build-python${PYTHON_VERSION}:latest
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  id_tokens:
+    GITLAB_OIDC_TOKEN: { aud: sts.amazonaws.com }
+  <<: *oidc-assume
+  environment:
+    name: review/$CI_COMMIT_REF_SLUG
+    url: https://${AWS_REGION}.console.aws.amazon.com/cloudformation/home?region=${AWS_REGION}#/stacks?filteringText=accelya-app-${CI_COMMIT_REF_SLUG}
+    on_stop: cleanup-sandbox
+    auto_stop_in: 4 hours
+  script:
+    - sam build -t infra/template-app.yaml
+    - |
+      sam deploy \
+        --template-file .aws-sam/build/template.yaml \
+        --stack-name accelya-app-${CI_COMMIT_REF_SLUG} \
+        --resolve-s3 \
+        --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+        --parameter-overrides Learner=${CI_COMMIT_REF_SLUG} \
+        --no-confirm-changeset \
+        --no-fail-on-empty-changeset \
+        --tags programme=accelya owner=${CI_COMMIT_REF_SLUG} environment=mr-${CI_MERGE_REQUEST_IID}
+
+cleanup-sandbox:
+  stage: deploy-sandbox
+  needs: []
+  image: public.ecr.aws/sam/build-python${PYTHON_VERSION}:latest
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: manual
+      allow_failure: true
+  id_tokens:
+    GITLAB_OIDC_TOKEN: { aud: sts.amazonaws.com }
+  <<: *oidc-assume
+  environment:
+    name: review/$CI_COMMIT_REF_SLUG
+    action: stop
+  script:
+    - aws cloudformation delete-stack --stack-name accelya-app-${CI_COMMIT_REF_SLUG}
+    - aws cloudformation wait stack-delete-complete --stack-name accelya-app-${CI_COMMIT_REF_SLUG}
+
+# ──────────────────────────────────────────────────────────────────────────
+# INTEGRATION-TEST (E2E against the just-deployed sandbox stack)
+# ──────────────────────────────────────────────────────────────────────────
+integration-test:
+  stage: integration-test
+  needs:
+    - job: deploy-sandbox
+  image: python:${PYTHON_VERSION}-slim
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  id_tokens:
+    GITLAB_OIDC_TOKEN: { aud: sts.amazonaws.com }
+  <<: *oidc-assume
+  script:
+    - pip install --quiet -r requirements.txt
+    - python3 tests/integration_test.py --learner ${CI_COMMIT_REF_SLUG} --region ${AWS_REGION}
+  artifacts:
+    paths: [integration-results.json]
+    when: always

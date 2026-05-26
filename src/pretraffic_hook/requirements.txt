@@ -1,0 +1,1 @@
+# Empty requirements — handler uses only boto3 which is in the Lambda runtime

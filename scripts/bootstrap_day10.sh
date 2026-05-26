@@ -47,17 +47,26 @@ set -euo pipefail
 # ──────────────────────────────────────────────────────────────────────────
 LEARNER="${1:-}"
 MODE="full"
-[[ "${2:-}" == "--skip-endpoint" ]] && MODE="skip-endpoint"
-[[ "${2:-}" == "--verify-only"  ]] && MODE="verify-only"
-[[ "${2:-}" == "--teardown"     ]] && MODE="teardown"
+DAY=10                             # default: Day-10 bootstrap; --day=11 extends with OIDC + foundation stack
+for ARG in "${@:2}"; do
+  case "$ARG" in
+    --skip-endpoint) MODE="skip-endpoint" ;;
+    --verify-only)   MODE="verify-only" ;;
+    --teardown)      MODE="teardown" ;;
+    --day=10)        DAY=10 ;;
+    --day=11)        DAY=11 ;;
+    *)               ;;             # ignore unknown flags
+  esac
+done
 
 if [[ -z "$LEARNER" ]]; then
-  echo "Usage: bash scripts/bootstrap_day10.sh <learner> [--skip-endpoint|--verify-only|--teardown]"
+  echo "Usage: bash scripts/bootstrap_day10.sh <learner> [--skip-endpoint|--verify-only|--teardown] [--day=10|--day=11]"
   echo ""
   echo "  <learner>          your name suffix (e.g. 'jai', 'priya'); lowercase, no spaces"
   echo "  --skip-endpoint    skip SageMaker endpoint (if another learner has the cap)"
   echo "  --verify-only      check what's present without creating anything"
   echo "  --teardown         delete everything tagged with your learner suffix"
+  echo "  --day=11           also create OIDC provider + IAM role + foundation stack (Day-11 prep)"
   exit 1
 fi
 
@@ -593,6 +602,152 @@ done
 ok "Log retention 14d + TracingConfig Active on all present Lambdas"
 
 # ──────────────────────────────────────────────────────────────────────────
+# STAGES 14-16 — Day-11 extensions (only if --day=11 specified)
+# ──────────────────────────────────────────────────────────────────────────
+if [[ "$DAY" -ge 11 && "$MODE" != "verify-only" ]]; then
+
+  stage 14 "OIDC identity provider for token.actions.githubusercontent.com (Day-11)"
+  EXISTING_OIDC=$(aws iam list-open-id-connect-providers \
+    --query "OpenIDConnectProviderList[?contains(Arn,'token.actions.githubusercontent.com')].Arn" \
+    --output text 2>/dev/null || echo "")
+  if [[ -n "$EXISTING_OIDC" && "$EXISTING_OIDC" != "None" ]]; then
+    OIDC_PROVIDER_ARN="$EXISTING_OIDC"
+    ok "Provider already exists (shared across cohort): $OIDC_PROVIDER_ARN"
+  else
+    # GitHub OIDC well-known thumbprint (rotates rarely; AWS auto-validates
+    # well-known issuers since 2023, so an empty thumbprint also works).
+    # Source: AWS docs — https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_create_oidc.html
+    THUMB="6938fd4d98bab03faadb97b34396831e3780aea1"
+    OIDC_PROVIDER_ARN=$(aws iam create-open-id-connect-provider \
+      --url "https://token.actions.githubusercontent.com" \
+      --client-id-list "sts.amazonaws.com" \
+      --thumbprint-list "$THUMB" \
+      --tags "Key=programme,Value=accelya" "Key=owner,Value=$LEARNER" \
+      --query 'OpenIDConnectProviderArn' --output text 2>/dev/null) || {
+        err "OIDC provider create failed"; exit 1
+      }
+    ok "Created: $OIDC_PROVIDER_ARN"
+  fi
+
+  stage 15 "IAM role accelya-github-oidc-$LEARNER (Day-11)"
+  OIDC_ROLE_NAME="accelya-github-oidc-${LEARNER}"
+  GITHUB_OWNER="${GITHUB_OWNER:-jaisingh-builds}"
+  GITHUB_REPO="${GITHUB_REPO:-accelya-agentic-aws}"
+
+  TRUST_TEMPLATE="$INFRA_DIR/oidc-trust-policy.json"
+  if [[ ! -f "$TRUST_TEMPLATE" ]]; then
+    warn "infra/oidc-trust-policy.json missing — skipping Day-11 stages 15-16"
+  else
+    sed -e "s|<account>|$ACCOUNT_ID|g" \
+        -e "s|<owner>|$GITHUB_OWNER|g" \
+        -e "s|<repo>|$GITHUB_REPO|g" \
+      "$TRUST_TEMPLATE" > /tmp/${LEARNER}-trust.json
+    python3 - <<PY > /tmp/${LEARNER}-trust-clean.json
+import json
+with open("/tmp/${LEARNER}-trust.json") as f: d = json.load(f)
+# Strip ALL annotation fields recursively (keys starting with _)
+def strip(o):
+    if isinstance(o, dict):
+        return {k: strip(v) for k, v in o.items() if not (isinstance(k, str) and k.startswith("_"))}
+    if isinstance(o, list):
+        return [strip(x) for x in o]
+    return o
+print(json.dumps(strip(d), separators=(',', ':')))
+PY
+    if aws iam get-role --role-name "$OIDC_ROLE_NAME" >/dev/null 2>&1; then
+      aws iam update-assume-role-policy --role-name "$OIDC_ROLE_NAME" \
+        --policy-document file:///tmp/${LEARNER}-trust-clean.json
+      ok "Updated trust policy (owner=$GITHUB_OWNER repo=$GITHUB_REPO)"
+    else
+      aws iam create-role --role-name "$OIDC_ROLE_NAME" \
+        --assume-role-policy-document file:///tmp/${LEARNER}-trust-clean.json \
+        --tags "Key=programme,Value=accelya" "Key=owner,Value=$LEARNER" >/dev/null
+      ok "Created role: arn:aws:iam::$ACCOUNT_ID:role/$OIDC_ROLE_NAME"
+    fi
+
+    # Inline CI policy — least-priv for sam deploy of app stacks
+    cat > /tmp/${LEARNER}-ci-policy.json <<JSON
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Sid":"CFN","Effect":"Allow","Action":["cloudformation:*"],
+     "Resource":["arn:aws:cloudformation:$AWS_REGION:$ACCOUNT_ID:stack/accelya-app-*/*",
+                 "arn:aws:cloudformation:$AWS_REGION:$ACCOUNT_ID:stack/accelya-foundation-*/*"]},
+    {"Sid":"CFNTransform","Effect":"Allow",
+     "Action":["cloudformation:CreateChangeSet"],
+     "Resource":["arn:aws:cloudformation:$AWS_REGION:aws:transform/Serverless-2016-10-31",
+                 "arn:aws:cloudformation:$AWS_REGION:aws:transform/Include"]},
+    {"Sid":"CFNRead","Effect":"Allow",
+     "Action":["cloudformation:DescribeStacks","cloudformation:GetTemplate",
+               "cloudformation:ListExports","cloudformation:ListStackResources",
+               "cloudformation:ValidateTemplate"],
+     "Resource":"*"},
+    {"Sid":"Lambda","Effect":"Allow","Action":["lambda:*"],
+     "Resource":"arn:aws:lambda:$AWS_REGION:$ACCOUNT_ID:function:accelya-*"},
+    {"Sid":"LambdaRead","Effect":"Allow",
+     "Action":["lambda:ListFunctions","lambda:GetAccountSettings"],"Resource":"*"},
+    {"Sid":"IAMRole","Effect":"Allow",
+     "Action":["iam:CreateRole","iam:DeleteRole","iam:GetRole","iam:PassRole",
+               "iam:PutRolePolicy","iam:DeleteRolePolicy","iam:GetRolePolicy",
+               "iam:AttachRolePolicy","iam:DetachRolePolicy","iam:ListRolePolicies",
+               "iam:ListAttachedRolePolicies","iam:TagRole"],
+     "Resource":"arn:aws:iam::$ACCOUNT_ID:role/accelya-*"},
+    {"Sid":"Logs","Effect":"Allow","Action":["logs:*"],
+     "Resource":"arn:aws:logs:$AWS_REGION:$ACCOUNT_ID:log-group:/aws/lambda/accelya-*"},
+    {"Sid":"States","Effect":"Allow","Action":["states:*"],
+     "Resource":"arn:aws:states:$AWS_REGION:$ACCOUNT_ID:stateMachine:inference-pipeline-*"},
+    {"Sid":"CW","Effect":"Allow","Action":["cloudwatch:*"],"Resource":"*"},
+    {"Sid":"CodeDeploy","Effect":"Allow","Action":["codedeploy:*"],
+     "Resource":"arn:aws:codedeploy:$AWS_REGION:$ACCOUNT_ID:*"},
+    {"Sid":"S3SamBucket","Effect":"Allow","Action":["s3:*"],
+     "Resource":["arn:aws:s3:::aws-sam-cli-managed-*","arn:aws:s3:::aws-sam-cli-managed-*/*"]},
+    {"Sid":"S3Data","Effect":"Allow","Action":["s3:*"],
+     "Resource":["arn:aws:s3:::$BUCKET","arn:aws:s3:::$BUCKET/*"]}
+  ]
+}
+JSON
+    aws iam put-role-policy --role-name "$OIDC_ROLE_NAME" \
+      --policy-name "${OIDC_ROLE_NAME}-inline" \
+      --policy-document file:///tmp/${LEARNER}-ci-policy.json
+    ok "Inline CI policy attached"
+    say "  Sleeping 8s for IAM eventual consistency..."
+    sleep 8
+  fi
+
+  stage 16 "Foundation stack accelya-foundation-$LEARNER (Day-11)"
+  FOUNDATION_TEMPLATE="$INFRA_DIR/template-foundation.yaml"
+  FOUNDATION_STACK="accelya-foundation-${LEARNER}"
+  if [[ ! -f "$FOUNDATION_TEMPLATE" ]]; then
+    warn "infra/template-foundation.yaml missing — skipping stage 16"
+  elif aws cloudformation describe-stacks --stack-name "$FOUNDATION_STACK" \
+        --region "$AWS_REGION" >/dev/null 2>&1; then
+    STATUS=$(aws cloudformation describe-stacks --stack-name "$FOUNDATION_STACK" \
+      --region "$AWS_REGION" --query 'Stacks[0].StackStatus' --output text)
+    if [[ "$STATUS" == *_COMPLETE ]]; then
+      ok "Foundation stack already $STATUS (skip update — Retain resources)"
+    else
+      warn "Foundation stack in $STATUS — may need manual intervention"
+    fi
+  elif ! command -v sam >/dev/null 2>&1; then
+    warn "sam CLI missing — install via 'brew tap aws/tap && brew install aws-sam-cli' or 'pip install aws-sam-cli'"
+    warn "Skipping foundation stack creation"
+  else
+    sam deploy -t "$FOUNDATION_TEMPLATE" \
+      --stack-name "$FOUNDATION_STACK" \
+      --resolve-s3 \
+      --capabilities CAPABILITY_IAM \
+      --parameter-overrides "Learner=$LEARNER" \
+      --no-confirm-changeset \
+      --no-fail-on-empty-changeset \
+      --tags "programme=accelya" "owner=$LEARNER" "environment=lab" \
+      --region "$AWS_REGION" || {
+        err "Foundation stack create failed"; exit 1
+      }
+    ok "Foundation stack created"
+  fi
+fi    # end of $DAY -ge 11 block
+
+# ──────────────────────────────────────────────────────────────────────────
 # FINAL SUMMARY
 # ──────────────────────────────────────────────────────────────────────────
 stage F "Summary — what you have right now"
@@ -616,6 +771,15 @@ printf "%-50s %s\n" "SQS $DLQ_NAME" \
   "$([ -n "$DLQ_URL" ] && echo OK || echo MISSING)"
 printf "%-50s %s\n" "SageMaker endpoint $ENDPOINT_NAME" \
   "$(aws sagemaker describe-endpoint --endpoint-name $ENDPOINT_NAME --region $AWS_REGION --query EndpointStatus --output text 2>/dev/null || echo NOT_DEPLOYED)"
+
+if [[ "$DAY" -ge 11 ]]; then
+  printf "%-50s %s\n" "OIDC provider token.actions.githubusercontent.com" \
+    "$(aws iam list-open-id-connect-providers --query "length(OpenIDConnectProviderList[?contains(Arn,'token.actions.githubusercontent.com')])" --output text 2>/dev/null || echo MISSING)"
+  printf "%-50s %s\n" "OIDC role accelya-github-oidc-$LEARNER" \
+    "$(aws iam get-role --role-name accelya-github-oidc-$LEARNER --query 'Role.RoleName' --output text 2>/dev/null || echo MISSING)"
+  printf "%-50s %s\n" "Foundation stack accelya-foundation-$LEARNER" \
+    "$(aws cloudformation describe-stacks --stack-name accelya-foundation-$LEARNER --region $AWS_REGION --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo MISSING)"
+fi
 
 echo ""
 echo "Lambda count: $LAMBDA_COUNT / 10"

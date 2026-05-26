@@ -1,0 +1,290 @@
+# .windsurfrules — v8 (Day 11 Lab 1 target state)
+#
+# DEPLOY CONTEXT block inserted between OBSERVABILITY CONTEXT and CATALOG CONTEXT.
+# v8 is the FINAL prompt-layer version of the programme. Day 12 capstone uses v8 as-is.
+
+## REPO RULES
+- Lambdas: src/<component>/handler.py + tests/test_<component>.py
+- ASL state machines: infra/*.asl.json
+- IaC: infra/template-foundation.yaml (stateful, retained) + infra/template-app.yaml (ephemeral)
+- CI: .github/workflows/sandbox-deploy.yml (primary) + .github/workflows/sandbox-cleanup.yml (PR-close teardown)
+- CI reference: docs/ci-reference/gitlab-ci-example.yml (appendix only — corps on GitLab can adapt)
+- OIDC: infra/oidc-trust-policy.json (GitHub trust template)
+- Glue + Athena: scripts/provision_m6_glue.sh + sql/m6-*.sql
+- Kinesis + DDB streaming: provisioned via foundation stack
+- Streaming Lambdas: defined in app stack via AWS::Serverless::Function
+- SageMaker endpoint (D9): scripts/deploy_m9_endpoint.sh + src/predict/handler.py
+- Observability helpers: src/common/observability.py
+- Audit folders (committed): prompts/ reviews/ design/ sql/
+- Region locked: ap-south-1
+- Branches: module-N-<learner>; PRs only (GitHub primary; MR if cohort uses GitLab).
+
+## CONSTRAINTS
+- Bedrock: invoke via APAC inference PROFILE:
+    apac.anthropic.claude-3-5-sonnet-20241022-v2:0
+- Bedrock budget: max 50 invocations + 20,000 tokens per learner per session.
+- Bedrock HARD COST GUARD: BEDROCK_MAX_INVOCATIONS=45, BEDROCK_MAX_TOKENS=18000
+- Bedrock FORBIDDEN: Studio, Knowledge Bases, Agents, AgentCore.
+- Lambda: programme tally = 11 (10 from D1-D9 + pretraffic-hook D11);
+    sandbox itself has no hard cap. Cumulative tally enforced by preflight script.
+- SageMaker: max 1 endpoint per learner; serverless ONLY (no provisioned);
+  no GPU; MUST be deleted at end of Day 9 Lab 3.
+- Glue: max 3 jobs; max 4 DPU/job; max 6 DPU-h cumulative.
+- DynamoDB: PAY_PER_REQUEST billing.
+- Kinesis: 2 shards per stream (sandbox default).
+- Step Functions: 256 KiB state limit.
+- Athena: workgroup accelya_<learner> with 100 MB bytes-scanned cap.
+- GitHub: PR-driven workflow (primary). GitLab MR pattern is appendix-only.
+  Repo: github.com/jaisingh-builds/accelya-agentic-aws.
+- AWS Cost Anomaly Detection: 1 DIMENSIONAL monitor per account (sandbox-shared).
+  REUSE the auto-created `Default-Services-Monitor`.
+
+## DAILY RESET CONTEXT
+# (unchanged from v7)
+
+## KNOWN-ERROR REGISTER
+# (unchanged from v7; plus 4 new D11-specific entries below)
+#
+# 10. `InvalidIdentityToken: Token has invalid audience` (AssumeRoleWithWebIdentity)
+#     Cause: Audience in the OIDC JWT ≠ `:aud` in trust policy condition.
+#     Fix:   GitHub: aws-actions/configure-aws-credentials@v4 sets aud=sts.amazonaws.com
+#            automatically — DON'T override with `audience:` input unless you also
+#            update the trust policy. GitLab: id_tokens.<name>.aud MUST be 'sts.amazonaws.com'.
+#
+# 11. `Lambda function ... already exists` (sam deploy after manual create)
+#     Cause: Migration gate skipped — manual Lambdas collide with SAM-named ones.
+#     Fix:   bash scripts/preflight-lambda-cap.sh <learner> --delete-manual; then sam deploy.
+#
+# 12. `EnvironmentVariableUpdated` change set fails (sam deploy)
+#     Cause: SAM tries to update env vars on a Lambda whose alias is mid-deploy.
+#     Fix:   Wait for the current CodeDeploy deployment to complete; or sam deploy --no-fail-on-empty-changeset.
+#
+# 13. `CREATE_FAILED: ... already exists` on AWS::Logs::LogGroup
+#     Cause: Lambda runtime auto-created the log group before CFN got to it.
+#     Fix:   Pre-create log groups explicitly OR delete the auto-created group before sam deploy.
+#            Permanent fix: use the LogGroup + DependsOn + LoggingConfig.LogGroup pattern.
+
+## ASL CHUNK CONTEXT
+# (unchanged from v2)
+
+## SQS PARTIAL-BATCH CONTEXT
+# (unchanged from v2)
+
+## STREAM CONTEXT
+# (unchanged from v4)
+
+## STATE CONTEXT
+# (unchanged from v5)
+
+## MODEL CONTEXT
+# (unchanged from v6)
+
+## OBSERVABILITY CONTEXT
+# (unchanged from v7)
+
+## DEPLOY CONTEXT
+# Use this block when Cascade scaffolds ANY infra/*.yaml, .gitlab-ci.yml,
+# IAM trust policy, or anything else deploy-adjacent. Applies from Day 11.
+
+- SAM CLI version: 1.115+ required (older versions miss DeploymentPreference fields)
+- Stack naming contract:
+    foundation:  accelya-foundation-<learner>                    (stateful, retained)
+    app:         accelya-app-<learner>                           (manual deploy from trainer's account)
+    app per MR:  accelya-app-<branch-slug>                       (CI deploys these; auto-cleaned on MR close)
+- Two-stack split (MANDATORY):
+    foundation contains: DDB tables, Kinesis streams, SQS queues, SNS topics
+                         (anything carrying state, subscribers, or stable ARNs)
+    app contains:        Lambdas, Step Functions, dashboards, alarms, IAM roles
+                         (anything that should redeploy per MR)
+    app references foundation via !ImportValue accelya-foundation-<learner>-<OutputName>
+    NEVER duplicate stateful resources in the app stack.
+
+- DeletionPolicy MANDATORY on EVERY stateful resource in foundation:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Pair MUST appear together — Cascade auto-fails the review on either missing.
+
+- Every Lambda in app stack MUST have:
+    AutoPublishAlias: live
+    DeploymentPreference:
+      Type: Linear10PercentEvery1Minute
+      Hooks:
+        PreTraffic: !GetAtt PreTrafficHook.Arn
+      Alarms:
+        - !Ref IteratorAgeAlarm
+        - !Ref BedrockThrottleAlarm
+    (The pretraffic-hook Lambda itself is the only exception — it would be self-referential.)
+
+- Every Lambda MUST have explicit AWS::Logs::LogGroup:
+    AWS::Logs::LogGroup with:
+      LogGroupName: !Sub /aws/lambda/<fn-name>
+      RetentionInDays: 14
+      DeletionPolicy: Retain
+      UpdateReplacePolicy: Retain
+    Lambda block with:
+      DependsOn: <FnName>LogGroup            # CFN must create LogGroup BEFORE Function
+      LoggingConfig:
+        LogGroup: !Ref <FnName>LogGroup       # binds Function to OUR log group
+    Without this, Lambda runtime auto-creates the LogGroup with Never Expire,
+    and CFN fails on next deploy with 'already exists'.
+
+- OIDC trust policy contract (GitHub primary):
+    Principal.Federated: arn:aws:iam::<account>:oidc-provider/token.actions.githubusercontent.com
+    Action: sts:AssumeRoleWithWebIdentity
+    Condition:
+      StringEquals:
+        token.actions.githubusercontent.com:aud: sts.amazonaws.com   # default of configure-aws-credentials@v4
+      StringEquals (protected main):
+        token.actions.githubusercontent.com:sub: repo:<owner>/<repo>:ref:refs/heads/main
+      StringLike (feature branches):
+        token.actions.githubusercontent.com:sub: repo:<owner>/<repo>:ref:refs/heads/module-11-*
+      StringLike (PR builds):
+        token.actions.githubusercontent.com:sub: repo:<owner>/<repo>:pull_request
+    NEVER use: sub: '*' OR sub: 'repo:*' OR aud: '*'.
+
+- OIDC trust policy contract (GitLab appendix-only):
+    Principal.Federated: arn:aws:iam::<account>:oidc-provider/gitlab.com
+    Condition.StringEquals: gitlab.com:aud=sts.amazonaws.com
+    Condition.StringLike: gitlab.com:sub=project_path:<group>/<project>:ref_type:branch:ref:module-11-*
+    NEVER use: sub: '*' OR sub: 'project_path:*'.
+
+- Pre-deploy guard (CI):
+    scripts/preflight-lambda-cap.sh runs BEFORE sam deploy.
+    Counts list-functions + list-stacks; fails CI early with human message
+    if app-stack creation would breach the programme cap of 12 (= 11 + 1 buffer).
+
+- 4 scanners block merge:
+    bandit (Python SAST) — src/**/*.py
+    semgrep (multi-language) — src/ + tests/
+    cfn-lint (CloudFormation schema) — infra/template-*.yaml
+    cfn-nag (CFN security patterns) — infra/
+    Suppressions per-finding in committed YAML with rule ID + reason.
+    NEVER use tflint — it's Terraform-only, wrong tool for SAM/CFN.
+
+- HITL dim 9 (NEW today) — Deploy Auditability, max 15, pass ≥ 10:
+    1. DeletionPolicy on stateful (foundation)
+    2. OIDC scope narrow (no wildcard sub)
+    3. IAM minimum (no wildcard Resource on write/modify verbs)
+    4. Rollback wired (AutoPublishAlias + DeploymentPreference + Alarms)
+    5. Migration gate evidence (snapshot + delete + verify count=0)
+    Each scored 0-3.
+
+- 5 auto-fail red flags (Cascade PR-review BLOCKS regardless of total):
+    1. Static AWS key in CI secrets/variables:
+         GitHub: gh secret list && gh variable list
+                 grep -iE '^aws_(access_key_id|secret_access_key|session_token)$'
+         GitLab: glab variable list | grep -iE '^aws_...'
+       returns ANY result → BLOCK.
+       (Reference to ${{ secrets.AWS_OIDC_ROLE_ARN }} is OK — that's just a role ARN.)
+    2. OIDC sub wildcard:
+         grep -E '"(token\.actions\.githubusercontent\.com|gitlab\.com):sub":\s*"\*"|"sub":\s*"repo:\*"|project_path:\*' infra/oidc-trust-policy.json
+       returns ANY result → BLOCK.
+    3. Wildcard Resource on write IAM verb:
+         cfn-nag rule W11 fires → BLOCK.
+    4. Stateful resource without DeletionPolicy: Retain:
+         Any AWS::DynamoDB::Table, AWS::Kinesis::Stream, AWS::S3::Bucket,
+         AWS::SNS::Topic, AWS::SQS::Queue in foundation.yaml without Retain → BLOCK.
+    5. Lambda in app stack without DeploymentPreference + Alarms wired:
+         Any AWS::Serverless::Function (except pretraffic-hook) missing
+         AutoPublishAlias + DeploymentPreference.Alarms → BLOCK.
+
+- Manual rollback command (memorise — single-line):
+    aws lambda update-alias --function-name <fn>-<learner> \
+      --name live --function-version $PREV_VERSION
+
+- Forbidden patterns:
+    - Static AWS keys in GitHub secrets / GitLab CI variables (use OIDC)
+    - OIDC sub wildcards (repo:* or project_path:*)
+    - Stateful resource in foundation without DeletionPolicy: Retain
+    - Stateful resource defined in app stack
+    - Lambda in app stack without AutoPublishAlias + DeploymentPreference + Alarms
+    - sam deploy without --capabilities CAPABILITY_IAM
+    - tflint in CI (wrong tool for SAM)
+    - Hand-rolled CloudFormation for Lambda + alias + version (use AutoPublishAlias)
+    - Mutating foundation stack from PR pipelines (only trainer runbook touches it)
+    - Skipping the preflight script in CI
+    - Using ${{ secrets.AWS_ACCESS_KEY_ID }} or similar in GitHub workflows
+
+## CATALOG CONTEXT
+# (unchanged from v3)
+
+## EXAMPLES
+# (unchanged + 2 new D11 examples)
+- SAM Function with full DeploymentPreference (the standard skeleton):
+    PredictFunction:
+      Type: AWS::Serverless::Function
+      DependsOn: PredictLogGroup
+      Properties:
+        FunctionName: !Sub accelya-predict-cancel-risk-${Learner}
+        CodeUri: ../src/predict/
+        Handler: handler.handler
+        Runtime: python3.12
+        MemorySize: 512
+        Timeout: 45
+        Tracing: Active
+        Environment:
+          Variables:
+            ENDPOINT_NAME: !Sub accelya-cancel-risk-${Learner}
+            CONFIDENCE_THRESHOLD: '0.7'
+        LoggingConfig:
+          LogGroup: !Ref PredictLogGroup
+        AutoPublishAlias: live
+        DeploymentPreference:
+          Type: Linear10PercentEvery1Minute
+          Hooks:
+            PreTraffic: !GetAtt PreTrafficHook.Arn
+          Alarms:
+            - !Ref IteratorAgeAlarm
+            - !Ref BedrockThrottleAlarm
+    PredictLogGroup:
+      Type: AWS::Logs::LogGroup
+      DeletionPolicy: Retain
+      UpdateReplacePolicy: Retain
+      Properties:
+        LogGroupName: !Sub /aws/lambda/accelya-predict-cancel-risk-${Learner}
+        RetentionInDays: 14
+
+- OIDC trust policy (GitHub — correct, scoped):
+    {
+      "Version": "2012-10-17",
+      "Statement": [{
+        "Effect": "Allow",
+        "Principal": { "Federated": "arn:aws:iam::<account>:oidc-provider/token.actions.githubusercontent.com" },
+        "Action": "sts:AssumeRoleWithWebIdentity",
+        "Condition": {
+          "StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
+          "StringLike":   { "token.actions.githubusercontent.com:sub": "repo:jaisingh-builds/accelya-agentic-aws:ref:refs/heads/module-11-*" }
+        }
+      }]
+    }
+
+- GitHub Actions OIDC job pattern (use this — NOT manual sts assume-role):
+    jobs:
+      deploy:
+        runs-on: ubuntu-latest
+        permissions:
+          id-token: write     # MANDATORY — without this, no JWT is minted
+          contents: read
+        steps:
+          - uses: actions/checkout@v4
+          - uses: aws-actions/configure-aws-credentials@v4
+            with:
+              role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+              aws-region: ap-south-1
+              role-session-name: gh-${{ github.run_id }}
+          - run: aws sts get-caller-identity     # sanity check
+          - run: sam deploy ...
+
+## REVIEW
+- 9-dim HITL checklist (Deploy Auditability NEW in v8):
+    Correctness · Safety · Idempotency · Observability · Cost ·
+    Schema Discipline (D6) · Per-PK Ordering (D7) · Confidence Handling (D9) ·
+    Deploy Auditability (D11 — NEW)
+- HITL_REVIEW-<artefact>.md committed; PASS at >=19/27 AND every dim >=2/3
+- Cascade MR-review prompt (prompts/cascade-mr-review.txt) runs the 5 auto-fail
+  red flag grep checks LITERALLY against the diff. ANY red flag = BLOCK regardless
+  of total dim score.
+- 14-layer prompt: prompts/v14_deploy.txt includes DEPLOY CONTEXT
+- IAM: NEVER wildcards on write/modify verbs.
+- Region: every CLI uses --region ap-south-1.
+- Synthetic data only.

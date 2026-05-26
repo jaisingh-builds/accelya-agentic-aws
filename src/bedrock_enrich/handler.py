@@ -65,10 +65,15 @@ def _required_env(name: str, default: str | None = None) -> str:
 
 
 def _should_enrich(event_id: str, sample_rate: int) -> bool:
-    """Deterministic 1-in-N sampling. Replay-safe (NOT random)."""
+    """Deterministic 1-in-N sampling. Replay-safe (NOT random).
+
+    MD5 here is a SAMPLING HASH, not security. Deterministic event_id → bucket
+    mapping is all we need; cryptographic strength is irrelevant. We pass
+    `usedforsecurity=False` (Python 3.9+) so bandit B324 doesn't flag.
+    """
     if sample_rate <= 0:
         return True
-    h = int(hashlib.md5(event_id.encode("utf-8")).hexdigest(), 16)
+    h = int(hashlib.md5(event_id.encode("utf-8"), usedforsecurity=False).hexdigest(), 16)
     return (h % sample_rate) == 0
 
 

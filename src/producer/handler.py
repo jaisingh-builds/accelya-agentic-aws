@@ -58,8 +58,13 @@ kinesis = boto3.client("kinesis", region_name=REGION)
 
 MAX_RETRIES = 5
 MAX_BATCH = 500
+# Day-11 Path-A widening: booking added so the same producer handles both
+# halves of the integration test (booking + cancellation flow). Original
+# Day-9 producer was cancellation-events-only because the stream was named
+# 'cancellation-events-<learner>' — the stream now carries both event_types
+# (routed downstream by event_type in the consumer/SFN).
 KNOWN_EVENT_TYPES = {
-    "cancellation", "refund", "no_show", "upgrade", "seat_release",
+    "booking", "cancellation", "refund", "no_show", "upgrade", "seat_release",
 }
 
 
@@ -71,8 +76,14 @@ def _required_env(name: str) -> str:
 
 
 def _bucket_hash(s: str) -> int:
-    """Stable hash for PNR → 0..7 bucket."""
-    return int(hashlib.md5(s.encode()).hexdigest(), 16)
+    """Stable hash for PNR → 0..7 bucket.
+
+    MD5 here is a PARTITIONING HASH for Kinesis bucket selection, not security.
+    Deterministic PNR → bucket mapping preserves per-PNR ordering on shard
+    placement; cryptographic strength is irrelevant. `usedforsecurity=False`
+    (Python 3.9+) signals intent so bandit B324 doesn't flag.
+    """
+    return int(hashlib.md5(s.encode(), usedforsecurity=False).hexdigest(), 16)
 
 
 def _partition_key(event: dict[str, Any]) -> str:

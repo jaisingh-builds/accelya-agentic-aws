@@ -1,0 +1,114 @@
+# .github/workflows/sandbox-cleanup.yml — tears down the per-PR sandbox stack
+# when the PR closes (merged or closed without merge).
+#
+# This is GitHub's equivalent of GitLab's `environment:on_stop:` block.
+# GitHub doesn't have a built-in "stop environment" hook, so we trigger
+# on the `pull_request: closed` event directly.
+
+name: Accelya sandbox cleanup
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+  workflow_dispatch:        # manual cleanup
+    inputs:
+      pr_number:
+        description: 'PR number whose sandbox stack to delete'
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+
+jobs:
+  cleanup-sandbox:
+    name: Cleanup · delete app stack
+    runs-on: ubuntu-latest
+    environment:
+      name: pr-${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+
+    steps:
+      # SECURITY: github.* context values are treated as untrusted input by
+      # semgrep rule `run-shell-injection`. We lift every `${{ ... }}` into
+      # an env: var first, then reference "$VAR" in the script — that way
+      # the script sees a fixed shell var, never a templated interpolation.
+      - name: Determine PR number
+        id: pr
+        env:
+          PR_EVENT_NUMBER: ${{ github.event.pull_request.number }}
+          PR_DISPATCH_NUMBER: ${{ github.event.inputs.pr_number }}
+        run: |
+          PR_NUM="${PR_EVENT_NUMBER:-$PR_DISPATCH_NUMBER}"
+          if [ -z "$PR_NUM" ]; then
+            echo "❌ No PR number"; exit 1
+          fi
+          echo "number=$PR_NUM" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gh-cleanup-pr${{ steps.pr.outputs.number }}
+
+      - name: Delete app stack
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          STACK="accelya-app-pr-${PR_NUMBER}"
+          if aws cloudformation describe-stacks --stack-name "$STACK" --region "$AWS_REGION" >/dev/null 2>&1; then
+            echo "Deleting $STACK ..."
+            aws cloudformation delete-stack --stack-name "$STACK" --region "$AWS_REGION"
+            aws cloudformation wait stack-delete-complete --stack-name "$STACK" --region "$AWS_REGION"
+            echo "✓ Deleted"
+          else
+            echo "Stack $STACK not present (already cleaned)"
+          fi
+
+      # Lambda log groups in template-app.yaml are declared with
+      # DeletionPolicy: Retain — that's the right call for prod (keeps logs
+      # when stack is deleted) but in sandbox-per-PR mode it leaves orphan
+      # log groups behind. Next deploy with the same PR number hits
+      # "AlreadyExists" on CREATE. So we explicitly delete /aws/lambda/
+      # accelya-*-pr-N log groups here. The two-tier policy (Retain in
+      # template, delete in sandbox cleanup) gives us prod-safety + sandbox-
+      # ergonomics without a conditional DeletionPolicy in the template.
+      - name: Delete orphan Lambda log groups for this PR
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          set -e
+          PREFIX="/aws/lambda/accelya-"
+          SUFFIX="-pr-${PR_NUMBER}"
+          # List all log groups, filter to ones whose name ends with -pr-N.
+          # describe-log-groups doesn't support suffix search natively, so
+          # we list with prefix accelya- then grep client-side.
+          GROUPS=$(aws logs describe-log-groups \
+            --region "$AWS_REGION" \
+            --log-group-name-prefix "$PREFIX" \
+            --query 'logGroups[].logGroupName' \
+            --output text 2>/dev/null | tr '\t' '\n' | grep -E "${SUFFIX}\$" || true)
+          if [ -z "$GROUPS" ]; then
+            echo "No orphan log groups for pr-${PR_NUMBER}"
+            exit 0
+          fi
+          echo "Deleting orphan log groups:"
+          echo "$GROUPS"
+          for lg in $GROUPS; do
+            aws logs delete-log-group --log-group-name "$lg" --region "$AWS_REGION" 2>&1 \
+              | head -2 || true
+          done
+          echo "✓ Log groups deleted"
+
+      - name: Confirm zero remaining sandbox stacks for this PR
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          aws cloudformation list-stacks --region "$AWS_REGION" \
+            --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE ROLLBACK_COMPLETE \
+            --query "StackSummaries[?StackName=='accelya-app-pr-${PR_NUMBER}'].StackName" \
+            --output text
