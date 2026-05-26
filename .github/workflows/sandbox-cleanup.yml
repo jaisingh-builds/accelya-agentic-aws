@@ -69,6 +69,41 @@ jobs:
             echo "Stack $STACK not present (already cleaned)"
           fi
 
+      # Lambda log groups in template-app.yaml are declared with
+      # DeletionPolicy: Retain — that's the right call for prod (keeps logs
+      # when stack is deleted) but in sandbox-per-PR mode it leaves orphan
+      # log groups behind. Next deploy with the same PR number hits
+      # "AlreadyExists" on CREATE. So we explicitly delete /aws/lambda/
+      # accelya-*-pr-N log groups here. The two-tier policy (Retain in
+      # template, delete in sandbox cleanup) gives us prod-safety + sandbox-
+      # ergonomics without a conditional DeletionPolicy in the template.
+      - name: Delete orphan Lambda log groups for this PR
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          set -e
+          PREFIX="/aws/lambda/accelya-"
+          SUFFIX="-pr-${PR_NUMBER}"
+          # List all log groups, filter to ones whose name ends with -pr-N.
+          # describe-log-groups doesn't support suffix search natively, so
+          # we list with prefix accelya- then grep client-side.
+          GROUPS=$(aws logs describe-log-groups \
+            --region "$AWS_REGION" \
+            --log-group-name-prefix "$PREFIX" \
+            --query 'logGroups[].logGroupName' \
+            --output text 2>/dev/null | tr '\t' '\n' | grep -E "${SUFFIX}\$" || true)
+          if [ -z "$GROUPS" ]; then
+            echo "No orphan log groups for pr-${PR_NUMBER}"
+            exit 0
+          fi
+          echo "Deleting orphan log groups:"
+          echo "$GROUPS"
+          for lg in $GROUPS; do
+            aws logs delete-log-group --log-group-name "$lg" --region "$AWS_REGION" 2>&1 \
+              | head -2 || true
+          done
+          echo "✓ Log groups deleted"
+
       - name: Confirm zero remaining sandbox stacks for this PR
         env:
           PR_NUMBER: ${{ steps.pr.outputs.number }}

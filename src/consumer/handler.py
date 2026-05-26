@@ -68,8 +68,12 @@ ddb = boto3.client("dynamodb", region_name=REGION)
 sfn = boto3.client("stepfunctions", region_name=REGION)
 s3 = boto3.client("s3", region_name=REGION)
 
+# Day-11 Path-A widening: booking added so the consumer accepts both halves
+# of the integration test (booking + cancellation flow). The stream
+# 'cancellation-events-<learner>' now carries both event_types; the consumer
+# routes by event_type downstream rather than rejecting booking as schema_drift.
 KNOWN_EVENT_TYPES = {
-    "cancellation", "refund", "no_show", "upgrade", "seat_release",
+    "booking", "cancellation", "refund", "no_show", "upgrade", "seat_release",
 }
 
 
@@ -81,19 +85,26 @@ def _required_env(name: str) -> str:
 
 
 def _claim_idempotency(table: str, pk: str, ttl_days: int = 7) -> bool:
-    """Returns True if claim succeeded (new key)."""
+    """Returns True if claim succeeded (new key).
+
+    NOTE: foundation's stream_seen_keys_<learner> DDB table uses 'event_id' as
+    its HASH key attribute name. We pass the stream-PK value (composite of
+    stream/shard/sequence) under the 'event_id' attribute — the value semantics
+    are still "unique idempotency token per Kinesis record," but the attribute
+    name matches the table schema.
+    """
     now = int(time.time())
     ttl = now + (ttl_days * 86_400)
     try:
         ddb.put_item(
             TableName=table,
             Item={
-                "pk": {"S": pk},
+                "event_id": {"S": pk},
                 "status": {"S": "CLAIMED"},
                 "claimed_at": {"N": str(now)},
                 "ttl": {"N": str(ttl)},
             },
-            ConditionExpression="attribute_not_exists(pk)",
+            ConditionExpression="attribute_not_exists(event_id)",
         )
         return True
     except ClientError as e:
@@ -107,7 +118,7 @@ def _mark_status(table: str, pk: str, status: str) -> None:
     now = int(time.time())
     ddb.update_item(
         TableName=table,
-        Key={"pk": {"S": pk}},
+        Key={"event_id": {"S": pk}},  # foundation table HASH key is 'event_id'
         UpdateExpression="SET #s = :s, updated_at = :t",
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={

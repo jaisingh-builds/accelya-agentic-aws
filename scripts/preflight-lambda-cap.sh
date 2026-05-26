@@ -67,25 +67,44 @@ PROJECTED=$((EXISTING_COUNT + TEMPLATE_LAMBDAS))
 echo "  Projected total post-deploy (worst case): $PROJECTED"
 
 # ── Delete-manual mode (Day-11 Lab 1 migration gate; trainer-only) ──────
+# IMPORTANT: only delete Lambdas that are NOT already CFN-managed by
+# accelya-app-<learner>. Earlier versions of this script blindly deleted
+# every accelya-*-<learner> Lambda, which destroyed CFN-managed Lambdas
+# on Path-A re-deploys (the original 3-Lambda slice from Day 11 Lab 2).
+# CFN's stack-resources view persists even after the actual resource is
+# deleted, producing stack drift that's hard to recover from.
 if [[ "$MODE" == "delete-manual" ]]; then
   echo ""
   echo "─── MIGRATION GATE: snapshot + delete manual Lambdas ───────────"
   mkdir -p reviews/m11-pre-migration
+
+  # Get the set of Lambda names CFN currently manages in accelya-app-<learner>
+  APP_STACK="accelya-app-${LEARNER}"
+  CFN_MANAGED=$(aws cloudformation list-stack-resources \
+    --stack-name "$APP_STACK" --region "$REGION" \
+    --query "StackResourceSummaries[?ResourceType=='AWS::Lambda::Function'].PhysicalResourceId" \
+    --output text 2>/dev/null | tr '\t' '\n' | sort -u)
+
+  if [[ -n "$CFN_MANAGED" ]]; then
+    echo "  CFN-managed (will SKIP):"
+    echo "$CFN_MANAGED" | sed 's/^/    - /'
+  fi
+
+  DELETED_COUNT=0
   for FN in $EXISTING; do
+    if echo "$CFN_MANAGED" | grep -qx "$FN"; then
+      echo "  Skip (CFN-managed):  $FN"
+      continue
+    fi
     SNAPSHOT="reviews/m11-pre-migration/${FN}.json"
     echo "  Snapshot: $FN → $SNAPSHOT"
     aws lambda get-function-configuration --function-name "$FN" \
       --region "$REGION" --output json > "$SNAPSHOT"
-    echo "  Delete:   $FN"
+    echo "  Delete (manual):     $FN"
     aws lambda delete-function --function-name "$FN" --region "$REGION"
+    DELETED_COUNT=$((DELETED_COUNT + 1))
   done
-  REMAINING=$(aws lambda list-functions --region "$REGION" \
-    --query "Functions[?contains(FunctionName,'-${LEARNER}')]" --output text | wc -l)
-  if [[ "$REMAINING" -ne 0 ]]; then
-    echo "❌ Expected 0 Lambdas after migration; found $REMAINING"
-    exit 1
-  fi
-  echo "  ✓ All manual Lambdas snapshotted + deleted. Safe to sam deploy."
+  echo "  ✓ Migration gate complete: $DELETED_COUNT manual Lambdas removed, CFN-managed preserved."
   exit 0
 fi
 
