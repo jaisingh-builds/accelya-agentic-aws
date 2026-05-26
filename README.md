@@ -102,6 +102,11 @@ windsurf .
 - **Programme reference docs**: `docs/programme-content-plan.md`, `docs/sandbox-rules.md`, `docs/toolchain-vocab.md`.
 - **Day-by-day handouts**: distributed at the start of each module.
 
+## Course completion
+
+- **Post-course assessment**: <https://forms.cloud.microsoft/r/Nf1sdeqHKr>
+- **Final feedback**: <https://forms.cloud.microsoft/r/Nx2Gpez5kc>
+
 ---
 
 *Built for the Accelya Kale cohort, May–June 2026. Synthetic data only.*
